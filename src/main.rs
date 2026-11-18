@@ -1,10 +1,11 @@
 mod auth;
 mod config;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -15,9 +16,16 @@ use percent_encoding::percent_decode_str;
 use crate::config::{RuntimeConfig, SharedConfig};
 
 #[derive(Clone)]
+pub struct FaviconData {
+    pub bytes: Bytes,
+    pub content_type: &'static str,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub config: SharedConfig,
     pub secure_cookie: bool,
+    pub favicon: Option<FaviconData>,
 }
 
 impl AppState {
@@ -97,9 +105,22 @@ fn split_link_and_rest(trimmed: &str) -> (&str, &str) {
     }
 }
 
+async fn handle_favicon(State(state): State<AppState>) -> Response {
+    match &state.favicon {
+        Some(fav) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, fav.content_type)],
+            fav.bytes.clone(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/_auth", get(auth::handle_auth_get).post(auth::handle_auth_post))
+        .route("/favicon.ico", get(handle_favicon))
         .fallback(get(handle_redirect))
         .layer(middleware::from_fn(add_security_headers))
         .with_state(state)
@@ -113,6 +134,38 @@ fn parse_bool_env(name: &str, default: bool) -> bool {
         ),
         Err(_) => default,
     }
+}
+
+fn favicon_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ico") => "image/x-icon",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/x-icon",
+    }
+}
+
+fn load_favicon_from_env() -> Result<Option<FaviconData>, String> {
+    let path = match std::env::var("FAVICON_FILE") {
+        Ok(val) if !val.trim().is_empty() => PathBuf::from(val),
+        _ => return Ok(None),
+    };
+
+    let bytes = std::fs::read(&path)
+        .map_err(|err| format!("failed to read FAVICON_FILE {}: {err}", path.display()))?;
+
+    Ok(Some(FaviconData {
+        bytes: Bytes::from(bytes),
+        content_type: favicon_content_type(&path),
+    }))
 }
 
 async fn shutdown_signal() {
@@ -148,10 +201,18 @@ async fn main() {
 
     let addr = std::env::var("GOLINKS_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let secure_cookie = parse_bool_env("GOLINKS_SECURE_COOKIE", true);
+    let favicon = match load_favicon_from_env() {
+        Ok(fav) => fav,
+        Err(err) => {
+            eprintln!("Startup failed: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let state = AppState {
         config: shared_config,
         secure_cookie,
+        favicon,
     };
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -206,6 +267,7 @@ mod tests {
                 links,
             }))),
             secure_cookie,
+            favicon: None,
         }
     }
 
@@ -420,6 +482,7 @@ mod tests {
         let app = build_router(AppState {
             config: shared.clone(),
             secure_cookie: false,
+            favicon: None,
         });
 
         // Update YAML with new key and new link
@@ -491,5 +554,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_works.status(), StatusCode::FOUND);
+    }
+
+    #[tokio::test]
+    async fn favicon_endpoint_serves_file_or_404() {
+        let app_without_favicon = build_router(test_state(false));
+        let missing = app_without_favicon
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_security_headers(missing.headers());
+
+        let mut state_with_favicon = test_state(false);
+        let payload = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        state_with_favicon.favicon = Some(FaviconData {
+            bytes: Bytes::from(payload.clone()),
+            content_type: favicon_content_type(Path::new("icon.png")),
+        });
+        let app_with_favicon = build_router(state_with_favicon);
+
+        let present = app_with_favicon
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(present.status(), StatusCode::OK);
+        assert_security_headers(present.headers());
+        assert_eq!(
+            present
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png")
+        );
+        let body = present.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), payload.as_slice());
     }
 }

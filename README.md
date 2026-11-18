@@ -32,6 +32,7 @@ links:
 | `GOLINKS_FILE` | *(required locally; `/data/config.yaml` in Docker)* | Path to the YAML configuration file. |
 | `GOLINKS_ADDR` | `0.0.0.0:8080` | Address and port to bind the HTTP server. |
 | `GOLINKS_SECURE_COOKIE` | `true` | Adds the `Secure` attribute to the session cookie. Set to `false` for local `http://localhost` testing. |
+| `FAVICON_FILE` | *(unset)* | Optional path to a favicon file served at `/favicon.ico` (`.ico`, `.png`, `.svg`, `.jpg`, `.webp`, `.gif`). |
 
 ## Browser Setup (Chrome / Brave)
 
