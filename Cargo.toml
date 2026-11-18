@@ -1,0 +1,22 @@
+[package]
+name = "golinks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+form_urlencoded = "1"
+hex = "0.4"
+hmac = "0.12"
+notify = "8"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
