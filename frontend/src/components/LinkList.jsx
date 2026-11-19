@@ -1,9 +1,11 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 export default function LinkList({ links }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
+  const [promptLink, setPromptLink] = useState(null); // { key, target } | null
+  const [paramValue, setParamValue] = useState('');
 
   const entries = useMemo(() => {
     const sorted = Object.entries(links).sort(([a], [b]) => a.localeCompare(b));
@@ -14,6 +16,37 @@ export default function LinkList({ links }) {
         key.toLowerCase().includes(q) || target.toLowerCase().includes(q)
     );
   }, [links, query]);
+
+  useEffect(() => {
+    if (!promptLink) return;
+    function onKeyDown(e) {
+      if (e.key === 'Escape') {
+        setPromptLink(null);
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [promptLink]);
+
+  function handleOpenClick(e, key, target) {
+    e.stopPropagation();
+    if (target.includes('%s')) {
+      e.preventDefault();
+      setParamValue('');
+      setPromptLink({ key, target });
+    }
+  }
+
+  function handlePromptSubmit(e) {
+    e.preventDefault();
+    if (!promptLink) return;
+    const base = `/${encodeURIComponent(promptLink.key)}`;
+    const url = paramValue
+      ? `${base}/${encodeURIComponent(paramValue)}`
+      : base;
+    window.open(url, '_blank', 'noopener,noreferrer');
+    setPromptLink(null);
+  }
 
   return (
     <div className="page-shell">
@@ -74,7 +107,7 @@ export default function LinkList({ links }) {
                 href={`/${encodeURIComponent(key)}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                onClick={(e) => e.stopPropagation()}
+                onClick={(e) => handleOpenClick(e, key, target)}
                 title={`Open /${key}`}
               >
                 Open ↗
@@ -82,6 +115,46 @@ export default function LinkList({ links }) {
             </li>
           ))}
         </ul>
+      )}
+
+      {promptLink && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setPromptLink(null)}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="param-dialog-title"
+        >
+          <div className="card modal-card" onClick={(e) => e.stopPropagation()}>
+            <h2 id="param-dialog-title">Open &ldquo;{promptLink.key}&rdquo;</h2>
+            <p className="muted modal-target">{promptLink.target}</p>
+            <form onSubmit={handlePromptSubmit}>
+              <div className="field">
+                <label htmlFor="param-input">Parameter</label>
+                <input
+                  id="param-input"
+                  type="text"
+                  placeholder="Enter value for %s"
+                  autoFocus
+                  value={paramValue}
+                  onChange={(e) => setParamValue(e.target.value)}
+                />
+              </div>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => setPromptLink(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary">
+                  Go
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );
