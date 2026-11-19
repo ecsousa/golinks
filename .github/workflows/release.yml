@@ -12,6 +12,31 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install and build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
   build-binaries:
     strategy:
       matrix:
@@ -85,7 +110,7 @@ jobs:
           files: ${{ matrix.name }}
 
   build-docker:
-    needs: build-binaries
+    needs: [build-frontend, build-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -93,6 +118,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: public
 
       - name: Download Linux x64 binary
         uses: actions/download-artifact@v4

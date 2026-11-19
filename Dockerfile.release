@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 
 ARG TARGETARCH
+COPY public /app/public
 COPY bin/golinks-${TARGETARCH} /app/golinks
 RUN chmod +x /app/golinks
 

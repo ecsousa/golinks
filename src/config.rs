@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::mpsc;
 
@@ -13,11 +13,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 const SESSION_CONTEXT: &[u8] = b"golinks-session-v1";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RawConfig {
     key: String,
     #[serde(default)]
-    links: HashMap<String, String>,
+    links: BTreeMap<String, String>,
 }
 
 /// Validated runtime configuration with a precomputed session token.
@@ -25,7 +25,7 @@ struct RawConfig {
 pub struct RuntimeConfig {
     pub key: String,
     pub auth_token: String,
-    pub links: HashMap<String, String>,
+    pub links: BTreeMap<String, String>,
 }
 
 pub type SharedConfig = Arc<RwLock<Arc<RuntimeConfig>>>;
@@ -55,6 +55,36 @@ pub fn load_config_from_path(path: &Path) -> Result<RuntimeConfig, String> {
         auth_token,
         links: raw.links,
     })
+}
+
+/// Persists `cfg` back to `path` as YAML.
+///
+/// Uses an atomic temp-file + rename when possible, falling back to direct overwrite
+/// (e.g. when `path` is a single-file Docker bind mount where rename returns EXDEV/EBUSY).
+pub fn save_config_to_path(path: &Path, cfg: &RuntimeConfig) -> Result<(), String> {
+    let raw = RawConfig {
+        key: cfg.key.clone(),
+        links: cfg.links.clone(),
+    };
+    let yaml = serde_yaml_ng::to_string(&raw)
+        .map_err(|err| format!("failed to serialize YAML config: {err}"))?;
+
+    if let Some(parent) = path.parent() {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config.yaml");
+        let tmp_path = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp_path, &yaml).is_ok() {
+            if std::fs::rename(&tmp_path, path).is_ok() {
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+
+    std::fs::write(path, &yaml)
+        .map_err(|err| format!("failed to write config file {}: {err}", path.display()))
 }
 
 /// Resolves a potentially relative path against the current working directory.
