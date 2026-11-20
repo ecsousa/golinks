@@ -35,6 +35,10 @@ export default function App() {
       setStatus('authenticated');
     } catch (err) {
       if (err instanceof UnauthorizedError) {
+        if (err.oidcEnabled) {
+          window.location.replace('/');
+          return;
+        }
         setStatus('unauthenticated');
       } else {
         setLoadError(err.message || 'Failed to load links.');
@@ -57,7 +61,11 @@ export default function App() {
     await refreshLinks();
   }, [refreshLinks]);
 
-  const handleUnauthorized = useCallback(() => {
+  const handleUnauthorized = useCallback((oidcEnabled = false) => {
+    if (oidcEnabled) {
+      window.location.replace('/');
+      return;
+    }
     setStatus('unauthenticated');
   }, []);
 

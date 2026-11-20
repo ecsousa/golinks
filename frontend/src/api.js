@@ -1,7 +1,8 @@
 export class UnauthorizedError extends Error {
-  constructor() {
+  constructor(oidcEnabled = false) {
     super('Unauthorized');
     this.name = 'UnauthorizedError';
+    this.oidcEnabled = Boolean(oidcEnabled);
   }
 }
 
@@ -19,10 +20,10 @@ export async function getLinks() {
     credentials: 'same-origin',
     headers: { Accept: 'application/json' },
   });
-  if (resp.status === 401) {
-    throw new UnauthorizedError();
-  }
   const data = await parseJsonSafe(resp);
+  if (resp.status === 401) {
+    throw new UnauthorizedError(data.oidcEnabled);
+  }
   if (!resp.ok) {
     throw new Error(data.error || `Failed to load links (${resp.status})`);
   }
@@ -50,10 +51,10 @@ export async function saveLink({ originalKey, key, target }) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ originalKey, key, target }),
   });
-  if (resp.status === 401) {
-    throw new UnauthorizedError();
-  }
   const data = await parseJsonSafe(resp);
+  if (resp.status === 401) {
+    throw new UnauthorizedError(data.oidcEnabled);
+  }
   if (!resp.ok) {
     throw new Error(data.error || `Failed to save link (${resp.status})`);
   }
@@ -67,10 +68,10 @@ export async function deleteLink(key) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key }),
   });
-  if (resp.status === 401) {
-    throw new UnauthorizedError();
-  }
   const data = await parseJsonSafe(resp);
+  if (resp.status === 401) {
+    throw new UnauthorizedError(data.oidcEnabled);
+  }
   if (!resp.ok) {
     throw new Error(data.error || `Failed to delete link (${resp.status})`);
   }
