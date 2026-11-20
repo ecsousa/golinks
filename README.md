@@ -4,27 +4,37 @@ A lightweight, self-hosted "go links" HTTP redirect service written in Rust with
 
 ## Features
 
-- **Cookie-based authentication:** Secrets are never placed in URLs, keeping them out of browser history, `Referer` headers, and reverse-proxy access logs.
+- **Cookie-based authentication with sliding-window JWTs:** Secrets are never placed in URLs, keeping them out of browser history, `Referer` headers, and reverse-proxy access logs. Both single-user and OIDC modes store an HS256 JWT signed with the user's `user_secret` in an `HttpOnly; SameSite=Lax` cookie (`golinks_auth`) whose expiry slides forward on every valid request (`GOLINKS_SESSION_TTL_DAYS`, default `30` days).
+- **Multi-user OIDC authentication (optional):** Enable `GOLINKS_OIDC_ENABLED=true` to authenticate users against any standard OpenID Connect provider (such as Authentik). Unauthenticated requests redirect straight to the OIDC provider, auto-provision users on first login with a random per-user secret, and strictly isolate each user's links.
 - **React management UI on `/`:** Sign in, browse/filter links, create new links, edit/rename keywords, and delete links—all served from `/` using `HashRouter` and `?action=...` API endpoints so link keywords never collide with UI or API routes.
 - **Quick create for unknown links:** Visiting an unknown keyword while authenticated redirects to `/#/edit/<keyword>` with the keyword pre-filled so you can save it immediately.
-- **Stateless `HttpOnly` sessions:** Session cookies store an `HMAC-SHA256` token derived from `GOLINKS_USER_SECRET_KEY` (`SameSite=Lax`, 5-year `Max-Age`). Only the derived token is persisted in the database; changing `GOLINKS_USER_SECRET_KEY` rotates the stored token and invalidates existing sessions.
 - **SQLite & PostgreSQL storage:** Stores users and links in SQLite (zero-config default with WAL mode) or PostgreSQL (dedicated `golinks` schema), with embedded schema initialization and automatic migrations on startup.
 - **Flexible `%s` substitution:** Supports both `/` and space as the separator between the link key and parameter, with `application/x-www-form-urlencoded` encoding for the parameter.
 - **Security headers on all responses:** `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`.
 
 ## Configuration
 
-`golinks` is configured entirely via environment variables. At minimum, set `GOLINKS_USER_SECRET_KEY`:
+`golinks` is configured entirely via environment variables:
 
-- **SQLite (default):** Set `GOLINKS_USER_SECRET_KEY` and optionally `GOLINKS_DB_PATH` (defaults to `./golinks.db` locally, or `/data/golinks.db` in Docker). Parent directories are created automatically.
+- **Single-user mode (default, `GOLINKS_OIDC_ENABLED=false`):** Set `GOLINKS_USER_SECRET_KEY` (and optionally `GOLINKS_USERNAME`).
+- **Multi-user OIDC mode (`GOLINKS_OIDC_ENABLED=true`):** Set `GOLINKS_OIDC_ISSUER_URL`, `GOLINKS_OIDC_CLIENT_ID`, `GOLINKS_OIDC_CLIENT_SECRET`, and `GOLINKS_OIDC_REDIRECT_URI`. `GOLINKS_USER_SECRET_KEY` and `GOLINKS_USERNAME` are ignored in this mode.
+- **SQLite (default):** Optionally set `GOLINKS_DB_PATH` (defaults to `./golinks.db` locally, or `/data/golinks.db` in Docker). Parent directories are created automatically.
 - **PostgreSQL:** Set `GOLINKS_DB_ENGINE=postgresql` along with `GOLINKS_DB_HOST`, `GOLINKS_DB_NAME`, `GOLINKS_DB_USERNAME`, and `GOLINKS_DB_PASSWORD`. The target database and user must exist with permission to create and write to the `golinks` schema.
 
 ### Environment Variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `GOLINKS_USER_SECRET_KEY` | *(required)* | Secret key used for login and session token derivation. Never stored in plaintext in the database or cookies. |
-| `GOLINKS_USERNAME` | `golinks` | Active username in the `users` table (max 32 characters). |
+| `GOLINKS_OIDC_ENABLED` | `false` | Enables multi-user OIDC authentication (`true`/`false`). When `true`, `GOLINKS_USER_SECRET_KEY` and `GOLINKS_USERNAME` are ignored. |
+| `GOLINKS_SESSION_TTL_DAYS` | `30` | Sliding-window JWT session lifetime in days (`1`–`3650`), applied in both single-user and OIDC modes. |
+| `GOLINKS_USER_SECRET_KEY` | *(required when OIDC disabled)* | Secret key used for single-user login and `user_secret` derivation. Never stored in plaintext in the database or cookies. |
+| `GOLINKS_USERNAME` | `golinks` | Active username in the `users` table when OIDC is disabled (max 255 characters). |
+| `GOLINKS_OIDC_ISSUER_URL` | *(required when OIDC enabled)* | OIDC provider issuer URL used for `.well-known/openid-configuration` discovery (e.g., `https://auth.example.com/application/o/golinks/`). |
+| `GOLINKS_OIDC_CLIENT_ID` | *(required when OIDC enabled)* | OIDC client ID. |
+| `GOLINKS_OIDC_CLIENT_SECRET` | *(required when OIDC enabled)* | OIDC client secret (also used to derive the HMAC signing key for the short-lived `golinks_oidc_state` cookie). |
+| `GOLINKS_OIDC_REDIRECT_URI` | *(required when OIDC enabled)* | Full callback URL registered in the OIDC provider pointing to the root of `golinks` (e.g., `https://go.example.com/`). |
+| `GOLINKS_OIDC_SCOPES` | `openid profile email` | Whitespace-separated OIDC scopes (`openid` is always included). |
+| `GOLINKS_OIDC_USERNAME_CLAIM` | `preferred_username` | Claim name in the ID token (or `userinfo` fallback) used as `users.user_name`. |
 | `GOLINKS_DB_ENGINE` | `sqlite` | Database backend: `sqlite` or `postgresql`. |
 | `GOLINKS_DB_PATH` | `./golinks.db` *(local)* / `/data/golinks.db` *(Docker)* | Path to the SQLite database file (`sqlite` engine only). |
 | `GOLINKS_DB_HOST` | *(required for `postgresql`)* | PostgreSQL server hostname. |
@@ -33,9 +43,59 @@ A lightweight, self-hosted "go links" HTTP redirect service written in Rust with
 | `GOLINKS_DB_USERNAME` | *(required for `postgresql`)* | PostgreSQL username. |
 | `GOLINKS_DB_PASSWORD` | *(required for `postgresql`; may be empty)* | PostgreSQL password. |
 | `GOLINKS_ADDR` | `0.0.0.0:8080` | Address and port to bind the HTTP server. |
-| `GOLINKS_SECURE_COOKIE` | `true` | Adds the `Secure` attribute to the session cookie. Set to `false` for local `http://localhost` testing. |
+| `GOLINKS_SECURE_COOKIE` | `true` | Adds the `Secure` attribute to cookies. Set to `false` for local `http://localhost` testing. |
 | `GOLINKS_UI_FILE` | `public/index.html` or `frontend/dist/index.html` | Optional explicit path to the built single-file UI `index.html`. |
 | `FAVICON_FILE` | *(bundled magnifier `.ico`)* | Optional path to override the built-in `/favicon.ico` (`.ico`, `.png`, `.svg`, `.jpg`, `.webp`, `.gif`). |
+
+## OIDC & Authentik Setup
+
+When `GOLINKS_OIDC_ENABLED=true`, unauthenticated requests to `/` or `/<keyword>` redirect directly to your OIDC provider. After login, the provider redirects back to `/` (`GOLINKS_OIDC_REDIRECT_URI`), where `golinks` verifies the ID token (with PKCE and nonce validation), extracts the username from `GOLINKS_OIDC_USERNAME_CLAIM` (checking the ID token first and falling back to the `userinfo` endpoint), provisions the user with a random 64-character hex `user_secret` if new, and sets the sliding-window HS256 JWT cookie (`golinks_auth`).
+
+> **Tip (forcing session revocation/rotation):** To revoke all active sessions for a specific OIDC user, clear their `user_secret` in the database (`UPDATE users SET user_secret = '' WHERE user_name = 'alice';`). Existing cookies immediately become invalid, and `golinks` automatically generates a fresh random secret on their next OIDC login.
+
+### Setting Up Authentik
+
+1. In the Authentik Admin Interface, go to **Applications → Providers → Create → OAuth2/OpenID Provider**:
+   - **Name:** `golinks`
+   - **Authentication flow:** your preferred authentication flow
+   - **Authorization flow:** `default-provider-authorization-implicit-consent` (or explicit consent)
+   - **Client type:** `Confidential`
+   - **Client ID & Client Secret:** copy both values for `GOLINKS_OIDC_CLIENT_ID` and `GOLINKS_OIDC_CLIENT_SECRET`
+   - **Redirect URIs/Origins (RegEx / Strict):** `https://go.example.com/` (exact root URL matching `GOLINKS_OIDC_REDIRECT_URI`—no `/callback` path so go-link keywords never collide)
+   - **Signing Key:** select a signing key (e.g. `authentik Self-signed Certificate`)
+   - **Advanced protocol settings → Scopes:** ensure `openid`, `profile`, and `email` are included
+2. Go to **Applications → Applications → Create**:
+   - **Name:** `Golinks`
+   - **Slug:** `golinks`
+   - **Provider:** select the `golinks` provider created above
+3. Open the `golinks` provider page and copy the **OpenID Configuration Issuer** URL (typically `https://auth.example.com/application/o/golinks/`).
+4. Configure `golinks` with those values:
+
+```bash
+docker run -d \
+  --name golinks \
+  -p 8080:8080 \
+  -e GOLINKS_OIDC_ENABLED=true \
+  -e GOLINKS_OIDC_ISSUER_URL=https://auth.example.com/application/o/golinks/ \
+  -e GOLINKS_OIDC_CLIENT_ID=your-client-id \
+  -e GOLINKS_OIDC_CLIENT_SECRET=your-client-secret \
+  -e GOLINKS_OIDC_REDIRECT_URI=https://go.example.com/ \
+  -e GOLINKS_SESSION_TTL_DAYS=30 \
+  -e GOLINKS_DB_ENGINE=postgresql \
+  -e GOLINKS_DB_HOST=db.example.com \
+  -e GOLINKS_DB_NAME=golinks \
+  -e GOLINKS_DB_USERNAME=golinks \
+  -e GOLINKS_DB_PASSWORD=someDbPassword \
+  ghcr.io/<owner>/golinks:latest
+```
+
+### Generic OIDC Providers
+
+Any standards-compliant OIDC provider (Keycloak, Authelia, Pocket ID, Okta, Google, etc.) works with the same configuration:
+- Register a **Confidential** authorization-code client with **PKCE (S256)** enabled.
+- Set the redirect URI to your `golinks` root URL (`https://go.example.com/`).
+- Set `GOLINKS_OIDC_ISSUER_URL` to the provider's issuer URL (the base URL serving `/.well-known/openid-configuration`).
+- If your provider uses a different username claim (e.g., `email` or `sub`), set `GOLINKS_OIDC_USERNAME_CLAIM`.
 
 ## Browser Setup (Chrome / Brave)
 
