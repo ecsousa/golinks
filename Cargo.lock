@@ -399,7 +399,9 @@ name = "golinks"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "form_urlencoded",
+ "getrandom 0.2.17",
  "hex",
  "hmac",
  "http-body-util",
