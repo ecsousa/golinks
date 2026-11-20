@@ -7,7 +7,6 @@ pub const AUTH_COOKIE_NAME: &str = "golinks_auth";
 const COOKIE_MAX_AGE_SECS: u64 = 157_680_000; // 5 years
 
 /// Derives a stateless hex-encoded HMAC-SHA256 session token from the configured secret key.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn derive_auth_token(key: &str) -> String {
     type HmacSha256 = Hmac<Sha256>;
     const SESSION_CONTEXT: &[u8] = b"golinks-session-v1";

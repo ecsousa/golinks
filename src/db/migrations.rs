@@ -10,7 +10,6 @@ const PG_MIGRATION_LOCK_KEY: i64 = 0x676f_6c69_6e6b_7301;
 
 /// Specification of full schema bootstrap SQL and incremental migrations.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct MigrationSpec<'a> {
     pub full_schema: &'a str,
     pub migrations: &'a [(&'a str, &'a str)],
@@ -18,7 +17,6 @@ pub struct MigrationSpec<'a> {
 }
 
 /// Returns the embedded SQLite migration specification generated at build time.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn embedded_sqlite_spec() -> MigrationSpec<'static> {
     MigrationSpec {
         full_schema: SQLITE_FULL_SCHEMA,
@@ -28,7 +26,6 @@ pub fn embedded_sqlite_spec() -> MigrationSpec<'static> {
 }
 
 /// Returns the embedded PostgreSQL migration specification generated at build time.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn embedded_postgres_spec() -> MigrationSpec<'static> {
     MigrationSpec {
         full_schema: POSTGRES_FULL_SCHEMA,
@@ -42,7 +39,6 @@ fn elapsed_ms(start: Instant) -> i32 {
 }
 
 /// Runs schema bootstrap or pending incremental migrations on a SQLite pool.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn run_sqlite_migrations(
     pool: &SqlitePool,
     spec: &MigrationSpec<'_>,
@@ -146,7 +142,6 @@ pub async fn run_sqlite_migrations(
 }
 
 /// Runs schema bootstrap or pending incremental migrations on a PostgreSQL pool under an advisory lock.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn run_postgres_migrations(
     pool: &PgPool,
     spec: &MigrationSpec<'_>,
@@ -174,7 +169,6 @@ pub async fn run_postgres_migrations(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 async fn run_postgres_migrations_locked(
     conn: &mut PgConnection,
     spec: &MigrationSpec<'_>,

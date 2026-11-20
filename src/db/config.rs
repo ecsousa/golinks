@@ -5,7 +5,6 @@ const DEFAULT_POSTGRES_PORT: u16 = 5432;
 
 /// Supported database backend engines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum DbEngine {
     Sqlite,
     Postgresql,
@@ -25,7 +24,6 @@ impl DbEngine {
 
 /// Engine-specific database connection configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum DbConfig {
     Sqlite {
         path: String,
@@ -41,7 +39,6 @@ pub enum DbConfig {
 
 /// Parsed application configuration from environment variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct AppConfig {
     pub username: String,
     pub user_secret_key: String,
@@ -50,13 +47,11 @@ pub struct AppConfig {
 
 impl AppConfig {
     /// Reads configuration from the process environment.
-    #[allow(dead_code)]
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
 
     /// Parses configuration using a custom environment variable lookup function.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_lookup<F>(lookup: F) -> Result<Self, String>
     where
         F: Fn(&str) -> Option<String>,

@@ -50,14 +50,13 @@ impl From<sqlx::Error> for DbError {
 
 /// User record stored in the `users` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct User {
     pub user_id: i32,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub user_name: String,
     pub user_secret: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn user_from_row((user_id, user_name, user_secret): (i32, String, String)) -> User {
     User {
         user_id,
@@ -67,7 +66,6 @@ fn user_from_row((user_id, user_name, user_secret): (i32, String, String)) -> Us
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Backend {
     Sqlite(SqlitePool),
     Postgres(PgPool),
@@ -75,12 +73,10 @@ pub(crate) enum Backend {
 
 /// Active database connection pool wrapper supporting SQLite and PostgreSQL.
 #[derive(Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Database {
     pub(crate) backend: Backend,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Database {
     /// Connects to the configured database backend.
     pub async fn connect(config: &DbConfig) -> Result<Self, DbError> {
