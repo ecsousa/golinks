@@ -11,7 +11,6 @@ use subtle::ConstantTimeEq;
 type HmacSha256 = Hmac<Sha256>;
 
 pub const AUTH_COOKIE_NAME: &str = "golinks_auth";
-const COOKIE_MAX_AGE_SECS: u64 = 157_680_000; // 5 years (removed in Task 5)
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JwtHeader {
@@ -138,24 +137,12 @@ pub fn extract_cookie_values<'a>(headers: &'a HeaderMap, cookie_name: &str) -> V
     values
 }
 
-/// Checks whether the incoming `Cookie` header contains a valid session token.
-pub fn is_authenticated(headers: &HeaderMap, expected_token: &str) -> bool {
-    extract_cookie_values(headers, AUTH_COOKIE_NAME)
-        .into_iter()
-        .any(|val| constant_time_eq(val, expected_token))
-}
-
 /// Builds the `Set-Cookie` header value for an authenticated session with an explicit `Max-Age`.
-pub fn build_auth_cookie_with_max_age(token: &str, max_age_secs: u64, secure: bool) -> String {
+pub fn build_auth_cookie(token: &str, max_age_secs: u64, secure: bool) -> String {
     let secure_attr = if secure { "; Secure" } else { "" };
     format!(
         "{AUTH_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age_secs}{secure_attr}"
     )
-}
-
-/// Builds the `Set-Cookie` header value for an authenticated session.
-pub fn build_auth_cookie(token: &str, secure: bool) -> String {
-    build_auth_cookie_with_max_age(token, COOKIE_MAX_AGE_SECS, secure)
 }
 
 #[cfg(test)]
@@ -255,8 +242,8 @@ mod tests {
     }
 
     #[test]
-    fn build_auth_cookie_with_max_age_sets_attributes() {
-        let secure = build_auth_cookie_with_max_age("tok", 2_592_000, true);
+    fn build_auth_cookie_sets_max_age_and_secure_flag() {
+        let secure = build_auth_cookie("tok", 2_592_000, true);
         assert!(secure.contains("golinks_auth=tok"));
         assert!(secure.contains("HttpOnly"));
         assert!(secure.contains("SameSite=Lax"));
@@ -264,7 +251,7 @@ mod tests {
         assert!(secure.contains("Max-Age=2592000"));
         assert!(secure.contains("; Secure"));
 
-        let insecure = build_auth_cookie_with_max_age("tok", 2_592_000, false);
+        let insecure = build_auth_cookie("tok", 2_592_000, false);
         assert!(!insecure.contains("Secure"));
     }
 }
