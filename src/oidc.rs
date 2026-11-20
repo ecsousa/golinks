@@ -1,5 +1,4 @@
 use std::fmt;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
@@ -363,7 +362,7 @@ impl OidcService {
 pub(crate) mod test_support {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use axum::Router;
     use axum::extract::State;

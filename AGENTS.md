@@ -62,7 +62,7 @@ Do **not** break these invariants without explicit user approval:
   $env:GOLINKS_SECURE_COOKIE = "false"
   cargo run
   ```
-- **Verification before committing:** Run `cargo test` for any Rust changes and `npm --prefix frontend run build` for any `frontend/` changes.
+- **Verification before committing:** Run both `cargo build` and `cargo test` for any Rust changes (ensure **zero compiler warnings** in both non-test and test builds) and `npm --prefix frontend run build` for any `frontend/` changes.
 
 ## Keeping Documentation Updated
 
