@@ -302,7 +302,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<String, _>("version").trim(), "v0000001");
+        assert_eq!(rows[0].get::<String, _>("version").trim(), "v0000002");
         assert!(rows[0].get::<bool, _>("success"));
 
         for table in ["users", "links"] {
@@ -401,20 +401,20 @@ mod tests {
             full_schema: base.full_schema,
             migrations: &[
                 (
-                    "v0000002",
+                    "v0000003",
                     "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, note TEXT NOT NULL);",
                 ),
                 (
-                    "v0000003",
+                    "v0000004",
                     "ALTER TABLE audit_log ADD COLUMN created_by TEXT NOT NULL DEFAULT 'system';",
                 ),
             ],
-            latest_version: "v0000003",
+            latest_version: "v0000004",
         };
 
         run_sqlite_migrations(pool, &synthetic_spec).await.unwrap();
 
-        // Verify v0000002 ran before v0000003 by using both the table and the added column.
+        // Verify v0000003 ran before v0000004 by using both the table and the added column.
         sqlx::query("INSERT INTO audit_log (note, created_by) VALUES (?, ?)")
             .bind("migrated")
             .bind("tester")
@@ -430,7 +430,7 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 3);
 
-        let expected = ["v0000001", "v0000002", "v0000003"];
+        let expected = ["v0000002", "v0000003", "v0000004"];
         for (row, exp_ver) in rows.iter().zip(expected.iter()) {
             assert_eq!(row.get::<String, _>("version").trim(), *exp_ver);
             assert!(row.get::<i64, _>("execution_time_ms") >= 0);
@@ -454,22 +454,22 @@ mod tests {
             full_schema: base.full_schema,
             migrations: &[
                 (
-                    "v0000002",
+                    "v0000003",
                     "CREATE TABLE should_rollback (id INTEGER PRIMARY KEY); THIS IS INVALID SQL;",
                 ),
                 (
-                    "v0000003",
+                    "v0000004",
                     "CREATE TABLE should_not_run (id INTEGER PRIMARY KEY);",
                 ),
             ],
-            latest_version: "v0000003",
+            latest_version: "v0000004",
         };
 
         let err = run_sqlite_migrations(pool, &failing_spec)
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("v0000002"),
+            err.to_string().contains("v0000003"),
             "unexpected error: {err}"
         );
 
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(rolled_back_table, 0);
 
         let failed_row =
-            sqlx::query("SELECT success FROM schema_migration WHERE version = 'v0000002'")
+            sqlx::query("SELECT success FROM schema_migration WHERE version = 'v0000003'")
                 .fetch_one(pool)
                 .await
                 .unwrap();
@@ -493,20 +493,20 @@ mod tests {
             full_schema: base.full_schema,
             migrations: &[
                 (
-                    "v0000002",
+                    "v0000003",
                     "CREATE TABLE should_rollback (id INTEGER PRIMARY KEY);",
                 ),
                 (
-                    "v0000003",
+                    "v0000004",
                     "CREATE TABLE should_not_run (id INTEGER PRIMARY KEY);",
                 ),
             ],
-            latest_version: "v0000003",
+            latest_version: "v0000004",
         };
 
         let err2 = run_sqlite_migrations(pool, &fixed_spec).await.unwrap_err();
         assert!(
-            err2.to_string().contains("v0000002"),
+            err2.to_string().contains("v0000003"),
             "unexpected error: {err2}"
         );
 
@@ -551,12 +551,13 @@ mod tests {
     #[test]
     fn embedded_postgres_schema_contains_golinks_schema_and_tables() {
         let spec = embedded_postgres_spec();
-        assert_eq!(spec.latest_version, "v0000001");
+        assert_eq!(spec.latest_version, "v0000002");
         assert!(spec
             .full_schema
             .contains("CREATE SCHEMA IF NOT EXISTS golinks"));
         assert!(spec.full_schema.contains("golinks.schema_migration"));
         assert!(spec.full_schema.contains("golinks.users"));
+        assert!(spec.full_schema.contains("user_name VARCHAR(255)"));
         assert!(spec.full_schema.contains("golinks.links"));
     }
 }

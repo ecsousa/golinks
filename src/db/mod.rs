@@ -220,6 +220,86 @@ impl Database {
         Ok(user_from_row(row))
     }
 
+    /// Returns an existing user (preserving any non-empty `user_secret`), rotates `user_secret`
+    /// if the existing row has an empty secret, or creates a new user with `new_secret`.
+    pub async fn get_or_create_user(
+        &self,
+        user_name: &str,
+        new_secret: &str,
+    ) -> Result<User, DbError> {
+        let existing = match self.get_user_by_name(user_name).await? {
+            Some(user) => user,
+            None => {
+                let inserted = match &self.backend {
+                    Backend::Sqlite(pool) => {
+                        sqlx::query_as::<_, (i32, String, String)>(
+                            "INSERT INTO users (user_name, user_secret) VALUES (?, ?) \
+                             ON CONFLICT (user_name) DO NOTHING \
+                             RETURNING user_id, user_name, user_secret",
+                        )
+                        .bind(user_name)
+                        .bind(new_secret)
+                        .fetch_optional(pool)
+                        .await?
+                    }
+                    Backend::Postgres(pool) => {
+                        sqlx::query_as::<_, (i32, String, String)>(
+                            "INSERT INTO users (user_name, user_secret) VALUES ($1, $2) \
+                             ON CONFLICT (user_name) DO NOTHING \
+                             RETURNING user_id, user_name, user_secret",
+                        )
+                        .bind(user_name)
+                        .bind(new_secret)
+                        .fetch_optional(pool)
+                        .await?
+                    }
+                };
+                if let Some(row) = inserted {
+                    return Ok(user_from_row(row));
+                }
+                self.get_user_by_name(user_name)
+                    .await?
+                    .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))?
+            }
+        };
+
+        if !existing.user_secret.trim().is_empty() {
+            return Ok(existing);
+        }
+
+        let updated = match &self.backend {
+            Backend::Sqlite(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "UPDATE users SET user_secret = ?, updated_on = CURRENT_TIMESTAMP \
+                     WHERE user_id = ? AND TRIM(user_secret) = '' \
+                     RETURNING user_id, user_name, user_secret",
+                )
+                .bind(new_secret)
+                .bind(existing.user_id)
+                .fetch_optional(pool)
+                .await?
+            }
+            Backend::Postgres(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "UPDATE users SET user_secret = $1, updated_on = CURRENT_TIMESTAMP \
+                     WHERE user_id = $2 AND TRIM(user_secret) = '' \
+                     RETURNING user_id, user_name, user_secret",
+                )
+                .bind(new_secret)
+                .bind(existing.user_id)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        if let Some(row) = updated {
+            return Ok(user_from_row(row));
+        }
+
+        self.get_user_by_id(existing.user_id)
+            .await?
+            .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))
+    }
+
     /// Fetches a user by primary key `user_id`.
     pub async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>, DbError> {
         let row = match &self.backend {
@@ -529,6 +609,75 @@ mod tests {
             .await
             .expect("count users");
         assert_eq!(user_count, 1);
+    }
+
+    #[tokio::test]
+    async fn get_or_create_user_preserves_secret_rotates_empty_supports_255_chars_and_concurrency() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("get_or_create_user.db");
+        let db = Database::connect(&DbConfig::Sqlite {
+            path: db_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("connect to sqlite");
+        db.run_migrations().await.expect("run migrations");
+
+        let long_name = "u".repeat(255);
+        let secret_a = "a".repeat(64);
+        let secret_b = "b".repeat(64);
+        let secret_c = "c".repeat(64);
+
+        let created = db
+            .get_or_create_user(&long_name, &secret_a)
+            .await
+            .expect("create 255-char user");
+        assert_eq!(created.user_name, long_name);
+        assert_eq!(created.user_secret, secret_a);
+
+        // Existing non-empty secret must be preserved.
+        let preserved = db
+            .get_or_create_user(&long_name, &secret_b)
+            .await
+            .expect("preserve existing secret");
+        assert_eq!(preserved, created);
+
+        // Clearing user_secret to empty forces rotation on next login.
+        sqlx::query("UPDATE users SET user_secret = '' WHERE user_id = ?")
+            .bind(created.user_id)
+            .execute(db.sqlite_pool())
+            .await
+            .expect("clear user_secret");
+        let rotated = db
+            .get_or_create_user(&long_name, &secret_c)
+            .await
+            .expect("rotate empty secret");
+        assert_eq!(rotated.user_id, created.user_id);
+        assert_eq!(rotated.user_secret, secret_c);
+
+        // Concurrent first-time creation must converge on a single row and secret.
+        let s1 = "1".repeat(64);
+        let s2 = "2".repeat(64);
+        let s3 = "3".repeat(64);
+        let s4 = "4".repeat(64);
+        let (r1, r2, r3, r4) = tokio::join!(
+            db.get_or_create_user("alice", &s1),
+            db.get_or_create_user("alice", &s2),
+            db.get_or_create_user("alice", &s3),
+            db.get_or_create_user("alice", &s4),
+        );
+        let u1 = r1.expect("concurrent get_or_create 1");
+        let u2 = r2.expect("concurrent get_or_create 2");
+        let u3 = r3.expect("concurrent get_or_create 3");
+        let u4 = r4.expect("concurrent get_or_create 4");
+        assert_eq!(u1, u2);
+        assert_eq!(u1, u3);
+        assert_eq!(u1, u4);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE user_name = ?")
+            .bind("alice")
+            .fetch_one(db.sqlite_pool())
+            .await
+            .expect("count alice");
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
