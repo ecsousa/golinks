@@ -15,7 +15,7 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::db::config::{AppConfig, DbConfig};
+use crate::db::config::{AppConfig, AuthConfig, DbConfig};
 use crate::db::{Database, User};
 
 const DEFAULT_FAVICON_BYTES: &[u8] = include_bytes!("../assets/favicon.ico");
@@ -457,11 +457,23 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let derived_secret = auth::derive_auth_token(&app_cfg.user_secret_key);
-    let user = match db.sync_user(&app_cfg.username, &derived_secret).await {
-        Ok(user) => user,
-        Err(err) => {
-            eprintln!("Startup failed: {err}");
+    let (username, user) = match &app_cfg.auth {
+        AuthConfig::SingleUser {
+            username,
+            user_secret_key,
+        } => {
+            let derived_secret = auth::derive_auth_token(user_secret_key);
+            let user = match db.sync_user(username, &derived_secret).await {
+                Ok(user) => user,
+                Err(err) => {
+                    eprintln!("Startup failed: {err}");
+                    std::process::exit(1);
+                }
+            };
+            (username.clone(), user)
+        }
+        AuthConfig::Oidc(_) => {
+            eprintln!("Startup failed: OIDC mode not yet wired");
             std::process::exit(1);
         }
     };
@@ -504,8 +516,7 @@ async fn main() {
     };
 
     eprintln!(
-        "Listening on {addr} (db={db_desc}, user={})",
-        app_cfg.username
+        "Listening on {addr} (db={db_desc}, user={username})"
     );
     if let Err(err) = axum::serve(listener, build_router(state))
         .with_graceful_shutdown(shutdown_signal())
