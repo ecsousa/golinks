@@ -1,8 +1,8 @@
 mod auth;
-mod config;
+mod db;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -15,9 +15,12 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::config::{RuntimeConfig, SharedConfig};
+use crate::db::config::{AppConfig, DbConfig};
+use crate::db::{Database, User};
 
 const DEFAULT_FAVICON_BYTES: &[u8] = include_bytes!("../assets/favicon.ico");
+const MAX_LINK_KEY_CHARS: usize = 32;
+const MAX_LINK_TARGET_CHARS: usize = 512;
 
 const FALLBACK_UI_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -33,17 +36,11 @@ pub struct FaviconData {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: SharedConfig,
-    pub config_path: PathBuf,
+    pub db: Database,
+    pub active_user_id: i32,
     pub secure_cookie: bool,
     pub favicon: FaviconData,
     pub ui_html: Arc<String>,
-}
-
-impl AppState {
-    pub fn current_config(&self) -> Arc<RuntimeConfig> {
-        self.config.read().expect("config lock poisoned").clone()
-    }
 }
 
 #[derive(Deserialize)]
@@ -92,6 +89,9 @@ fn validate_link_key(key: &str) -> Result<(), &'static str> {
     if key.is_empty() {
         return Err("Keyword must not be empty.");
     }
+    if key.chars().count() > MAX_LINK_KEY_CHARS {
+        return Err("Keyword must be at most 32 characters.");
+    }
     if key.chars().any(|c| c.is_whitespace() || c == '/' || c == '?' || c == '#') {
         return Err("Keyword must not contain spaces, '/', '?', or '#'.");
     }
@@ -102,10 +102,36 @@ fn validate_link_target(target: &str) -> Result<(), &'static str> {
     if target.is_empty() {
         return Err("Target URL must not be empty.");
     }
+    if target.chars().count() > MAX_LINK_TARGET_CHARS {
+        return Err("Target URL must be at most 512 characters.");
+    }
     if !(target.starts_with("http://") || target.starts_with("https://")) {
         return Err("Target URL must start with http:// or https://.");
     }
     Ok(())
+}
+
+async fn load_active_user(state: &AppState) -> Result<User, Response> {
+    match state.db.get_user_by_id(state.active_user_id).await {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => {
+            eprintln!(
+                "Database error: active user id {} not found",
+                state.active_user_id
+            );
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error",
+            ))
+        }
+        Err(err) => {
+            eprintln!("Database error loading active user: {err}");
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error",
+            ))
+        }
+    }
 }
 
 async fn handle_root_get(
@@ -116,11 +142,20 @@ async fn handle_root_get(
     match query.action.as_deref() {
         None => (StatusCode::OK, Html(state.ui_html.as_str().to_string())).into_response(),
         Some("getLinks") => {
-            let cfg = state.current_config();
-            if !auth::is_authenticated(&headers, &cfg.auth_token) {
+            let user = match load_active_user(&state).await {
+                Ok(u) => u,
+                Err(resp) => return resp,
+            };
+            if !auth::is_authenticated(&headers, &user.user_secret) {
                 return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
             }
-            (StatusCode::OK, Json(json!({ "links": cfg.links }))).into_response()
+            match state.db.list_links(user.user_id).await {
+                Ok(links) => (StatusCode::OK, Json(json!({ "links": links }))).into_response(),
+                Err(err) => {
+                    eprintln!("Database error listing links: {err}");
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "Database error")
+                }
+            }
         }
         Some(_) => json_error(StatusCode::BAD_REQUEST, "Unknown action"),
     }
@@ -144,12 +179,16 @@ async fn handle_root_post(
                 Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid JSON payload"),
             };
 
-            let cfg = state.current_config();
-            if !auth::constant_time_eq(&req.secret, &cfg.key) {
+            let user = match load_active_user(&state).await {
+                Ok(u) => u,
+                Err(resp) => return resp,
+            };
+            let candidate = auth::derive_auth_token(&req.secret);
+            if !auth::constant_time_eq(&candidate, &user.user_secret) {
                 return json_error(StatusCode::UNAUTHORIZED, "Invalid secret.");
             }
 
-            let cookie = auth::build_auth_cookie(&cfg.auth_token, state.secure_cookie);
+            let cookie = auth::build_auth_cookie(&user.user_secret, state.secure_cookie);
             (
                 StatusCode::OK,
                 [(header::SET_COOKIE, cookie)],
@@ -158,8 +197,11 @@ async fn handle_root_post(
                 .into_response()
         }
         "saveLink" => {
-            let cfg = state.current_config();
-            if !auth::is_authenticated(&headers, &cfg.auth_token) {
+            let user = match load_active_user(&state).await {
+                Ok(u) => u,
+                Err(resp) => return resp,
+            };
+            if !auth::is_authenticated(&headers, &user.user_secret) {
                 return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
             }
 
@@ -177,27 +219,24 @@ async fn handle_root_post(
                 return json_error(StatusCode::BAD_REQUEST, msg);
             }
 
-            let mut guard = state.config.write().expect("config lock poisoned");
-            let mut updated = (**guard).clone();
-
-            if let Some(orig) = req.original_key.as_deref().map(str::trim).filter(|s| !s.is_empty())
-                && orig != key
+            match state
+                .db
+                .save_link(user.user_id, req.original_key.as_deref(), &key, &target)
+                .await
             {
-                updated.links.remove(orig);
+                Ok(links) => (StatusCode::OK, Json(json!({ "links": links }))).into_response(),
+                Err(err) => {
+                    eprintln!("Database error saving link: {err}");
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "Database error")
+                }
             }
-            updated.links.insert(key, target);
-
-            if let Err(err) = config::save_config_to_path(&state.config_path, &updated) {
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
-            }
-
-            let links = updated.links.clone();
-            *guard = Arc::new(updated);
-            (StatusCode::OK, Json(json!({ "links": links }))).into_response()
         }
         "deleteLink" => {
-            let cfg = state.current_config();
-            if !auth::is_authenticated(&headers, &cfg.auth_token) {
+            let user = match load_active_user(&state).await {
+                Ok(u) => u,
+                Err(resp) => return resp,
+            };
+            if !auth::is_authenticated(&headers, &user.user_secret) {
                 return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
             }
 
@@ -211,20 +250,16 @@ async fn handle_root_post(
                 return json_error(StatusCode::BAD_REQUEST, "Keyword must not be empty.");
             }
 
-            let mut guard = state.config.write().expect("config lock poisoned");
-            let mut updated = (**guard).clone();
-
-            if updated.links.remove(key).is_none() {
-                return json_error(StatusCode::NOT_FOUND, "Link not found.");
+            match state.db.delete_link(user.user_id, key).await {
+                Ok(Some(links)) => {
+                    (StatusCode::OK, Json(json!({ "links": links }))).into_response()
+                }
+                Ok(None) => json_error(StatusCode::NOT_FOUND, "Link not found."),
+                Err(err) => {
+                    eprintln!("Database error deleting link: {err}");
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "Database error")
+                }
             }
-
-            if let Err(err) = config::save_config_to_path(&state.config_path, &updated) {
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
-            }
-
-            let links = updated.links.clone();
-            *guard = Arc::new(updated);
-            (StatusCode::OK, Json(json!({ "links": links }))).into_response()
         }
         _ => json_error(StatusCode::BAD_REQUEST, "Unknown action"),
     }
@@ -235,9 +270,12 @@ async fn handle_redirect(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let cfg = state.current_config();
+    let user = match load_active_user(&state).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
 
-    if !auth::is_authenticated(&headers, &cfg.auth_token) {
+    if !auth::is_authenticated(&headers, &user.user_secret) {
         let next = uri
             .path_and_query()
             .map(|pq| pq.as_str())
@@ -258,17 +296,28 @@ async fn handle_redirect(
     let (link_key_raw, rest_raw) = split_link_and_rest(trimmed);
     let link_key = percent_decode_str(link_key_raw).decode_utf8_lossy();
 
-    let Some(template) = cfg.links.get(link_key.as_ref()) else {
-        let encoded_key = utf8_percent_encode(link_key.as_ref(), NON_ALPHANUMERIC).to_string();
-        return (
-            StatusCode::FOUND,
-            [(header::LOCATION, format!("/#/edit/{encoded_key}"))],
-        )
-            .into_response();
+    let template = match state
+        .db
+        .get_link_target(user.user_id, link_key.as_ref())
+        .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            let encoded_key = utf8_percent_encode(link_key.as_ref(), NON_ALPHANUMERIC).to_string();
+            return (
+                StatusCode::FOUND,
+                [(header::LOCATION, format!("/#/edit/{encoded_key}"))],
+            )
+                .into_response();
+        }
+        Err(err) => {
+            eprintln!("Database error looking up link '{}': {err}", link_key);
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Database error");
+        }
     };
 
     let target = if !template.contains("%s") {
-        template.clone()
+        template
     } else if rest_raw.is_empty() {
         template.replace("%s", "")
     } else {
@@ -387,15 +436,7 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
-    let config_path = match std::env::var("GOLINKS_FILE") {
-        Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
-        _ => {
-            eprintln!("GOLINKS_FILE environment variable must be set");
-            std::process::exit(1);
-        }
-    };
-
-    let initial_config = match config::load_config_from_path(&config_path) {
+    let app_cfg = match AppConfig::from_env() {
         Ok(cfg) => cfg,
         Err(err) => {
             eprintln!("Startup failed: {err}");
@@ -403,11 +444,24 @@ async fn main() {
         }
     };
 
-    let shared_config: SharedConfig = Arc::new(RwLock::new(Arc::new(initial_config)));
-    let _watcher = match config::spawn_config_watcher(&config_path, shared_config.clone()) {
-        Ok(w) => w,
+    let db = match Database::connect(&app_cfg.db).await {
+        Ok(db) => db,
         Err(err) => {
-            eprintln!("Failed to start config watcher: {err}");
+            eprintln!("Startup failed: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(err) = db.run_migrations().await {
+        eprintln!("Startup failed: {err}");
+        std::process::exit(1);
+    }
+
+    let derived_secret = auth::derive_auth_token(&app_cfg.user_secret_key);
+    let user = match db.sync_user(&app_cfg.username, &derived_secret).await {
+        Ok(user) => user,
+        Err(err) => {
+            eprintln!("Startup failed: {err}");
             std::process::exit(1);
         }
     };
@@ -423,9 +477,19 @@ async fn main() {
     };
     let ui_html = load_ui_html();
 
+    let db_desc = match &app_cfg.db {
+        DbConfig::Sqlite { path } => format!("sqlite:{path}"),
+        DbConfig::Postgresql {
+            host,
+            port,
+            database,
+            ..
+        } => format!("postgresql://{host}:{port}/{database}"),
+    };
+
     let state = AppState {
-        config: shared_config,
-        config_path: config_path.clone(),
+        db,
+        active_user_id: user.user_id,
         secure_cookie,
         favicon,
         ui_html,
@@ -439,7 +503,10 @@ async fn main() {
         }
     };
 
-    eprintln!("Listening on {addr} (watching {})", config_path.display());
+    eprintln!(
+        "Listening on {addr} (db={db_desc}, user={})",
+        app_cfg.username
+    );
     if let Err(err) = axum::serve(listener, build_router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -452,42 +519,53 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::config::DbConfig;
+    use crate::db::Database;
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use std::collections::BTreeMap;
-    use std::time::Duration;
     use tower::ServiceExt;
 
-    fn test_state_with_path(config_path: PathBuf, secure_cookie: bool) -> AppState {
-        let mut links = BTreeMap::new();
-        links.insert(
-            "google".to_string(),
-            "https://www.google.com/search?q=%s".to_string(),
-        );
-        links.insert("docs".to_string(), "https://docs.example.com".to_string());
-        links.insert(
-            "m".to_string(),
-            "https://www.google.com/maps/preview?authuser=%s".to_string(),
-        );
+    async fn test_state(secure_cookie: bool) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("golinks.db");
+        let db = Database::connect(&DbConfig::Sqlite {
+            path: db_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap();
+        db.run_migrations().await.unwrap();
 
-        let key = "someSuperSecretValue".to_string();
-        let auth_token = config::derive_auth_token(&key);
+        let derived = auth::derive_auth_token("someSuperSecretValue");
+        let user = db.sync_user("golinks", &derived).await.unwrap();
 
-        AppState {
-            config: Arc::new(RwLock::new(Arc::new(RuntimeConfig {
-                key,
-                auth_token,
-                links,
-            }))),
-            config_path,
+        db.save_link(
+            user.user_id,
+            None,
+            "google",
+            "https://www.google.com/search?q=%s",
+        )
+        .await
+        .unwrap();
+        db.save_link(user.user_id, None, "docs", "https://docs.example.com")
+            .await
+            .unwrap();
+        db.save_link(
+            user.user_id,
+            None,
+            "m",
+            "https://www.google.com/maps/preview?authuser=%s",
+        )
+        .await
+        .unwrap();
+
+        let state = AppState {
+            db,
+            active_user_id: user.user_id,
             secure_cookie,
             favicon: default_favicon(),
             ui_html: Arc::new("<!DOCTYPE html><html><body>UI</body></html>".to_string()),
-        }
-    }
-
-    fn test_state(secure_cookie: bool) -> AppState {
-        test_state_with_path(PathBuf::from("nonexistent.yaml"), secure_cookie)
+        };
+        (state, dir)
     }
 
     fn assert_security_headers(headers: &HeaderMap) {
@@ -518,7 +596,8 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_root_serves_ui_and_links_redirect_to_next() {
-        let app = build_router(test_state(true));
+        let (state, _dir) = test_state(true).await;
+        let app = build_router(state);
 
         let root_resp = app
             .clone()
@@ -564,7 +643,8 @@ mod tests {
 
     #[tokio::test]
     async fn login_api_validates_secret_and_sets_cookie() {
-        let app = build_router(test_state(true));
+        let (state, _dir) = test_state(true).await;
+        let app = build_router(state);
 
         let bad = app
             .clone()
@@ -609,8 +689,8 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_redirects_url_encoding_and_unknown_redirect_to_edit() {
-        let state = test_state(false);
-        let token = state.current_config().auth_token.clone();
+        let (state, _dir) = test_state(false).await;
+        let token = auth::derive_auth_token("someSuperSecretValue");
         let cookie_hdr = format!("golinks_auth={token}");
         let app = build_router(state);
 
@@ -692,11 +772,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_get_save_rename_and_delete_links_persists_yaml() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("config.yaml");
-        let state = test_state_with_path(cfg_path.clone(), false);
-        let token = state.current_config().auth_token.clone();
+    async fn api_get_save_rename_and_delete_links_persists_db() {
+        let (state, dir) = test_state(false).await;
+        let user_id = state.active_user_id;
+        let db_path = dir.path().join("golinks.db");
+        let token = auth::derive_auth_token("someSuperSecretValue");
         let cookie_hdr = format!("golinks_auth={token}");
         let app = build_router(state);
 
@@ -734,11 +814,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(create_resp.status(), StatusCode::OK);
-        let reloaded = config::load_config_from_path(&cfg_path).unwrap();
-        assert_eq!(
-            reloaded.links.get("gh").map(String::as_str),
-            Some("https://github.com/%s")
-        );
 
         // saveLink (rename gh -> github)
         let rename_resp = app
@@ -757,15 +832,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rename_resp.status(), StatusCode::OK);
-        let reloaded = config::load_config_from_path(&cfg_path).unwrap();
-        assert!(!reloaded.links.contains_key("gh"));
-        assert_eq!(
-            reloaded.links.get("github").map(String::as_str),
-            Some("https://github.com/%s")
-        );
 
-        // deleteLink
-        let del_resp = app
+        // saveLink (rename github onto existing key docs)
+        let overwrite_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"originalKey":"github","key":"docs","target":"https://new-docs.example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overwrite_resp.status(), StatusCode::OK);
+
+        // deleteLink (missing returns 404)
+        let missing_del_resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -777,58 +865,163 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(missing_del_resp.status(), StatusCode::NOT_FOUND);
+
+        // deleteLink (existing m)
+        let del_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=deleteLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"key":"m"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(del_resp.status(), StatusCode::OK);
-        let reloaded = config::load_config_from_path(&cfg_path).unwrap();
-        assert!(!reloaded.links.contains_key("github"));
+
+        // Reopen a fresh Database connection to verify persistence on disk.
+        let reopened = Database::connect(&DbConfig::Sqlite {
+            path: db_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap();
+        let links = reopened.list_links(user_id).await.unwrap();
+        assert!(!links.contains_key("gh"));
+        assert!(!links.contains_key("github"));
+        assert!(!links.contains_key("m"));
+        assert_eq!(
+            links.get("docs").map(String::as_str),
+            Some("https://new-docs.example.com")
+        );
+        assert_eq!(
+            links.get("google").map(String::as_str),
+            Some("https://www.google.com/search?q=%s")
+        );
     }
 
     #[tokio::test]
-    async fn hot_reload_updates_links_and_invalidates_old_key_while_surviving_bad_yaml() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("golinks.yaml");
-        std::fs::write(
-            &cfg_path,
-            "key: firstSecret\nlinks:\n  docs: https://docs.example.com\n",
-        )
-        .unwrap();
+    async fn validation_enforces_32_and_512_unicode_char_limits() {
+        let (state, _dir) = test_state(false).await;
+        let token = auth::derive_auth_token("someSuperSecretValue");
+        let cookie_hdr = format!("golinks_auth={token}");
+        let app = build_router(state);
 
-        let initial = config::load_config_from_path(&cfg_path).unwrap();
-        let old_token = initial.auth_token.clone();
-        let shared: SharedConfig = Arc::new(RwLock::new(Arc::new(initial)));
-        let _watcher = config::spawn_config_watcher(&cfg_path, shared.clone()).unwrap();
+        let key_32 = "é".repeat(32);
+        let target_512 = format!("https://example.com/{}", "é".repeat(512 - 20));
+        assert_eq!(key_32.chars().count(), 32);
+        assert_eq!(target_512.chars().count(), 512);
 
-        let app = build_router(AppState {
-            config: shared.clone(),
-            config_path: cfg_path.clone(),
-            secure_cookie: false,
-            favicon: default_favicon(),
-            ui_html: Arc::new(FALLBACK_UI_HTML.to_string()),
-        });
+        let ok_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "key": key_32,
+                            "target": target_512,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
 
-        // Update YAML with new key and new link
-        std::fs::write(
-            &cfg_path,
-            "key: secondSecret\nlinks:\n  notes: https://notes.example.com\n",
-        )
-        .unwrap();
+        let key_33 = "é".repeat(33);
+        let bad_key_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "key": key_33,
+                            "target": "https://example.com",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_key_resp.status(), StatusCode::BAD_REQUEST);
 
-        // Wait up to 2s for watcher debounce + reload
-        let mut reloaded = false;
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if shared.read().unwrap().key == "secondSecret" {
-                reloaded = true;
-                break;
-            }
-        }
-        assert!(reloaded, "config did not hot-reload in time");
+        let target_513 = format!("https://example.com/{}", "é".repeat(513 - 20));
+        assert_eq!(target_513.chars().count(), 513);
+        let bad_target_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "key": "valid",
+                            "target": target_513,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_target_resp.status(), StatusCode::BAD_REQUEST);
+    }
 
-        // Old cookie should now be rejected (redirected to login)
+    #[tokio::test]
+    async fn redirect_returns_500_with_security_headers_on_db_error() {
+        let (state, _dir) = test_state(false).await;
+        let token = auth::derive_auth_token("someSuperSecretValue");
+        let cookie_hdr = format!("golinks_auth={token}");
+
+        sqlx::query("DROP TABLE links")
+            .execute(state.db.sqlite_pool())
+            .await
+            .unwrap();
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/google")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_security_headers(resp.headers());
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
+
+    #[tokio::test]
+    async fn secret_rotation_via_sync_user_invalidates_old_cookie() {
+        let (state, _dir) = test_state(false).await;
+        let old_token = auth::derive_auth_token("someSuperSecretValue");
+        let new_token = auth::derive_auth_token("secondSecret");
+
+        state.db.sync_user("golinks", &new_token).await.unwrap();
+
+        let app = build_router(state);
+
         let old_resp = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/notes")
+                    .uri("/docs")
                     .header(header::COOKIE, format!("golinks_auth={old_token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -836,21 +1029,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(old_resp.status(), StatusCode::FOUND);
+        assert_security_headers(old_resp.headers());
         assert_eq!(
             old_resp
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok()),
-            Some("/?next=%2Fnotes")
+            Some("/?next=%2Fdocs")
         );
 
-        // New cookie should resolve the newly added link
-        let new_token = config::derive_auth_token("secondSecret");
         let new_resp = app
-            .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/notes")
+                    .uri("/docs")
                     .header(header::COOKIE, format!("golinks_auth={new_token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -858,34 +1049,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_resp.status(), StatusCode::FOUND);
+        assert_security_headers(new_resp.headers());
         assert_eq!(
             new_resp
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok()),
-            Some("https://notes.example.com")
+            Some("https://docs.example.com")
         );
-
-        // Write invalid YAML and verify previous valid config remains active
-        std::fs::write(&cfg_path, "key: [unclosed").unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let still_works = app
-            .oneshot(
-                Request::builder()
-                    .uri("/notes")
-                    .header(header::COOKIE, format!("golinks_auth={new_token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(still_works.status(), StatusCode::FOUND);
     }
 
     #[tokio::test]
     async fn favicon_endpoint_serves_default_and_override() {
-        let app_default = build_router(test_state(false));
+        let (state_default, _dir1) = test_state(false).await;
+        let app_default = build_router(state_default);
         let default_resp = app_default
             .oneshot(
                 Request::builder()
@@ -907,7 +1084,7 @@ mod tests {
         let default_body = default_resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(default_body.as_ref(), DEFAULT_FAVICON_BYTES);
 
-        let mut state_override = test_state(false);
+        let (mut state_override, _dir2) = test_state(false).await;
         let payload = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         state_override.favicon = FaviconData {
             bytes: Bytes::from(payload.clone()),

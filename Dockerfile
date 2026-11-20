@@ -7,8 +7,9 @@ RUN npm run build
 
 FROM rust:1-bookworm AS backend-builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY assets ./assets
+COPY db ./db
 COPY src ./src
 RUN cargo build --release
 
@@ -18,7 +19,8 @@ WORKDIR /app
 COPY --from=backend-builder /app/target/release/golinks /app/golinks
 COPY --from=frontend-builder /app/frontend/dist/index.html /app/public/index.html
 
-ENV GOLINKS_FILE=/data/config.yaml
+ENV GOLINKS_DB_ENGINE=sqlite
+ENV GOLINKS_DB_PATH=/data/golinks.db
 ENV GOLINKS_ADDR=0.0.0.0:8080
 ENV GOLINKS_SECURE_COOKIE=true
 

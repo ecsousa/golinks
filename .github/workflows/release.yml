@@ -42,18 +42,18 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             name: golinks-linux-x64
-            use-cross: false
+            use-cross: true
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             name: golinks-linux-arm64
             use-cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: golinks-windows-x64.exe
             use-cross: false
-          - os: windows-latest
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             name: golinks-windows-arm64.exe
             use-cross: false
@@ -90,11 +90,11 @@ jobs:
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Rename and move artifact (Unix)
-        if: matrix.os != 'windows-latest'
+        if: runner.os != 'Windows'
         run: mv target/${{ matrix.target }}/release/golinks ${{ matrix.name }}
 
       - name: Rename and move artifact (Windows)
-        if: matrix.os == 'windows-latest'
+        if: runner.os == 'Windows'
         run: move target\${{ matrix.target }}\release\golinks.exe ${{ matrix.name }}
 
       - name: Upload Artifact
