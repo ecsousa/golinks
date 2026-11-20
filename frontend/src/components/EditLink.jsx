@@ -36,7 +36,7 @@ export default function EditLink({ links, onLinksUpdated, onUnauthorized }) {
       navigate('/', { replace: true });
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        onUnauthorized();
+        onUnauthorized(err.oidcEnabled);
         return;
       }
       setError(err.message || 'Failed to save link.');
@@ -54,7 +54,7 @@ export default function EditLink({ links, onLinksUpdated, onUnauthorized }) {
       navigate('/', { replace: true });
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        onUnauthorized();
+        onUnauthorized(err.oidcEnabled);
         return;
       }
       setError(err.message || 'Failed to delete link.');

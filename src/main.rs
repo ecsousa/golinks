@@ -1,5 +1,6 @@
 mod auth;
 mod db;
+mod oidc;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,8 +16,9 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::db::config::{AppConfig, DbConfig};
+use crate::db::config::{AppConfig, AuthConfig, DbConfig};
 use crate::db::{Database, User};
+use crate::oidc::{OidcError, OidcService, build_clear_state_cookie, sanitize_next_path};
 
 const DEFAULT_FAVICON_BYTES: &[u8] = include_bytes!("../assets/favicon.ico");
 const MAX_LINK_KEY_CHARS: usize = 32;
@@ -35,12 +37,35 @@ pub struct FaviconData {
 }
 
 #[derive(Clone)]
+pub enum AuthMode {
+    SingleUser { active_user_id: i32 },
+    Oidc(Arc<OidcService>),
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub db: Database,
-    pub active_user_id: i32,
+    pub auth_mode: AuthMode,
+    pub session_ttl_secs: u64,
     pub secure_cookie: bool,
     pub favicon: FaviconData,
     pub ui_html: Arc<String>,
+}
+
+impl AppState {
+    fn is_oidc(&self) -> bool {
+        matches!(self.auth_mode, AuthMode::Oidc(_))
+    }
+}
+
+#[derive(Deserialize)]
+struct RootQuery {
+    action: Option<String>,
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+    next: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +110,194 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
+fn unauthorized_json(state: &AppState) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "Unauthorized",
+            "oidcEnabled": state.is_oidc(),
+        })),
+    )
+        .into_response()
+}
+
+fn with_set_cookie(mut response: Response, cookie_val: HeaderValue) -> Response {
+    response.headers_mut().append(header::SET_COOKIE, cookie_val);
+    response
+}
+
+fn issue_session_cookie(state: &AppState, user: &User) -> HeaderValue {
+    let now = auth::current_unix_secs();
+    let jwt = auth::sign_session_jwt(&user.user_name, &user.user_secret, now, state.session_ttl_secs);
+    let cookie = auth::build_auth_cookie(&jwt, state.session_ttl_secs, state.secure_cookie);
+    HeaderValue::from_str(&cookie).expect("valid Set-Cookie header")
+}
+
+async fn load_single_user(state: &AppState, active_user_id: i32) -> Result<User, Response> {
+    match state.db.get_user_by_id(active_user_id).await {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => {
+            eprintln!("Database error: active user id {active_user_id} not found");
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error",
+            ))
+        }
+        Err(err) => {
+            eprintln!("Database error loading active user: {err}");
+            Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error",
+            ))
+        }
+    }
+}
+
+/// Authenticates the incoming request using the `golinks_auth` HS256 JWT cookie.
+/// Returns `Ok(Some((user, refreshed_set_cookie)))` on success, `Ok(None)` if unauthenticated,
+/// or `Err(Response)` on database error.
+async fn authenticate_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<(User, HeaderValue)>, Response> {
+    let now = auth::current_unix_secs();
+    for token in auth::extract_cookie_values(headers, auth::AUTH_COOKIE_NAME) {
+        let Some((claims, signing_input, sig_bytes)) = auth::parse_unverified_jwt(token) else {
+            continue;
+        };
+        if claims.exp <= now {
+            continue;
+        }
+        let user = match state.db.get_user_by_name(&claims.sub).await {
+            Ok(Some(u)) => u,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!("Database error looking up session user: {err}");
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Database error",
+                ));
+            }
+        };
+        if let AuthMode::SingleUser { active_user_id } = state.auth_mode {
+            if user.user_id != active_user_id {
+                continue;
+            }
+        }
+        if auth::verify_jwt_signature(&signing_input, &sig_bytes, &user.user_secret) {
+            let refreshed = issue_session_cookie(state, &user);
+            return Ok(Some((user, refreshed)));
+        }
+    }
+    Ok(None)
+}
+
+async fn redirect_to_oidc_login(
+    state: &AppState,
+    oidc: &OidcService,
+    next_path: &str,
+) -> Response {
+    match oidc.start_login(next_path, state.secure_cookie).await {
+        Ok((authorize_url, set_state_cookie)) => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, authorize_url),
+                (header::SET_COOKIE, set_state_cookie),
+            ],
+        )
+            .into_response(),
+        Err(err) => {
+            eprintln!("OIDC login redirect error: {err}");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Authentication provider is temporarily unavailable. Please try again.",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn handle_oidc_callback(
+    state: &AppState,
+    oidc: &OidcService,
+    headers: &HeaderMap,
+    query: &RootQuery,
+) -> Response {
+    let clear_state = build_clear_state_cookie(state.secure_cookie);
+
+    if let Some(err_code) = query.error.as_deref() {
+        let desc = query.error_description.as_deref().unwrap_or("");
+        eprintln!("OIDC provider returned error: {err_code} {desc}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::SET_COOKIE, clear_state)],
+            format!("OIDC authentication failed: {err_code}"),
+        )
+            .into_response();
+    }
+
+    let (Some(code), Some(state_param)) = (query.code.as_deref(), query.state.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::SET_COOKIE, clear_state)],
+            "Missing OIDC code or state parameter.",
+        )
+            .into_response();
+    };
+
+    let (username, next_path) = match oidc.complete_callback(headers, code, state_param).await {
+        Ok(res) => res,
+        Err(err) => {
+            eprintln!("OIDC callback failed: {err}");
+            let status = match err {
+                OidcError::InvalidState(_) => StatusCode::BAD_REQUEST,
+                OidcError::MissingUsernameClaim(_) | OidcError::InvalidUsername(_) => {
+                    StatusCode::FORBIDDEN
+                }
+                OidcError::ProviderUnavailable(_) => StatusCode::BAD_GATEWAY,
+                OidcError::TokenExchange(_) | OidcError::InvalidIdToken(_) => {
+                    StatusCode::UNAUTHORIZED
+                }
+            };
+            return (
+                status,
+                [(header::SET_COOKIE, clear_state)],
+                "OIDC authentication failed.",
+            )
+                .into_response();
+        }
+    };
+
+    let random_secret = auth::generate_random_user_secret();
+    let user = match state.db.get_or_create_user(&username, &random_secret).await {
+        Ok(u) => u,
+        Err(err) => {
+            eprintln!("Database error provisioning OIDC user: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::SET_COOKIE, clear_state)],
+                "Database error",
+            )
+                .into_response();
+        }
+    };
+
+    let auth_cookie = issue_session_cookie(state, &user);
+    let mut response = (
+        StatusCode::FOUND,
+        [(header::LOCATION, next_path)],
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, auth_cookie);
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_state).expect("valid clear state cookie"),
+    );
+    response
+}
+
 fn validate_link_key(key: &str) -> Result<(), &'static str> {
     if key.is_empty() {
         return Err("Keyword must not be empty.");
@@ -111,46 +324,49 @@ fn validate_link_target(target: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn load_active_user(state: &AppState) -> Result<User, Response> {
-    match state.db.get_user_by_id(state.active_user_id).await {
-        Ok(Some(user)) => Ok(user),
-        Ok(None) => {
-            eprintln!(
-                "Database error: active user id {} not found",
-                state.active_user_id
-            );
-            Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error",
-            ))
-        }
-        Err(err) => {
-            eprintln!("Database error loading active user: {err}");
-            Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error",
-            ))
-        }
-    }
-}
-
 async fn handle_root_get(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ActionQuery>,
+    Query(query): Query<RootQuery>,
 ) -> Response {
     match query.action.as_deref() {
-        None => (StatusCode::OK, Html(state.ui_html.as_str().to_string())).into_response(),
+        None => {
+            if let AuthMode::Oidc(oidc) = &state.auth_mode {
+                if query.code.is_some() || query.error.is_some() {
+                    return handle_oidc_callback(&state, oidc, &headers, &query).await;
+                }
+                match authenticate_session(&state, &headers).await {
+                    Ok(Some((_user, refreshed_cookie))) => {
+                        let resp =
+                            (StatusCode::OK, Html(state.ui_html.as_str().to_string())).into_response();
+                        with_set_cookie(resp, refreshed_cookie)
+                    }
+                    Ok(None) => {
+                        let next = sanitize_next_path(query.next.as_deref());
+                        redirect_to_oidc_login(&state, oidc, &next).await
+                    }
+                    Err(resp) => resp,
+                }
+            } else {
+                let resp =
+                    (StatusCode::OK, Html(state.ui_html.as_str().to_string())).into_response();
+                match authenticate_session(&state, &headers).await {
+                    Ok(Some((_user, refreshed_cookie))) => with_set_cookie(resp, refreshed_cookie),
+                    _ => resp,
+                }
+            }
+        }
         Some("getLinks") => {
-            let user = match load_active_user(&state).await {
-                Ok(u) => u,
+            let (user, refreshed_cookie) = match authenticate_session(&state, &headers).await {
+                Ok(Some(auth_res)) => auth_res,
+                Ok(None) => return unauthorized_json(&state),
                 Err(resp) => return resp,
             };
-            if !auth::is_authenticated(&headers, &user.user_secret) {
-                return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
-            }
             match state.db.list_links(user.user_id).await {
-                Ok(links) => (StatusCode::OK, Json(json!({ "links": links }))).into_response(),
+                Ok(links) => {
+                    let resp = (StatusCode::OK, Json(json!({ "links": links }))).into_response();
+                    with_set_cookie(resp, refreshed_cookie)
+                }
                 Err(err) => {
                     eprintln!("Database error listing links: {err}");
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Database error")
@@ -174,12 +390,22 @@ async fn handle_root_post(
 
     match action {
         "login" => {
+            let active_user_id = match state.auth_mode {
+                AuthMode::SingleUser { active_user_id } => active_user_id,
+                AuthMode::Oidc(_) => {
+                    return json_error(
+                        StatusCode::FORBIDDEN,
+                        "Password login is disabled when OIDC is enabled.",
+                    );
+                }
+            };
+
             let req: LoginRequest = match serde_json::from_slice(&body) {
                 Ok(v) => v,
                 Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid JSON payload"),
             };
 
-            let user = match load_active_user(&state).await {
+            let user = match load_single_user(&state, active_user_id).await {
                 Ok(u) => u,
                 Err(resp) => return resp,
             };
@@ -188,22 +414,16 @@ async fn handle_root_post(
                 return json_error(StatusCode::UNAUTHORIZED, "Invalid secret.");
             }
 
-            let cookie = auth::build_auth_cookie(&user.user_secret, state.secure_cookie);
-            (
-                StatusCode::OK,
-                [(header::SET_COOKIE, cookie)],
-                Json(json!({ "ok": true })),
-            )
-                .into_response()
+            let cookie = issue_session_cookie(&state, &user);
+            let resp = (StatusCode::OK, Json(json!({ "ok": true }))).into_response();
+            with_set_cookie(resp, cookie)
         }
         "saveLink" => {
-            let user = match load_active_user(&state).await {
-                Ok(u) => u,
+            let (user, refreshed_cookie) = match authenticate_session(&state, &headers).await {
+                Ok(Some(auth_res)) => auth_res,
+                Ok(None) => return unauthorized_json(&state),
                 Err(resp) => return resp,
             };
-            if !auth::is_authenticated(&headers, &user.user_secret) {
-                return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
-            }
 
             let req: SaveLinkRequest = match serde_json::from_slice(&body) {
                 Ok(v) => v,
@@ -224,7 +444,10 @@ async fn handle_root_post(
                 .save_link(user.user_id, req.original_key.as_deref(), &key, &target)
                 .await
             {
-                Ok(links) => (StatusCode::OK, Json(json!({ "links": links }))).into_response(),
+                Ok(links) => {
+                    let resp = (StatusCode::OK, Json(json!({ "links": links }))).into_response();
+                    with_set_cookie(resp, refreshed_cookie)
+                }
                 Err(err) => {
                     eprintln!("Database error saving link: {err}");
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "Database error")
@@ -232,13 +455,11 @@ async fn handle_root_post(
             }
         }
         "deleteLink" => {
-            let user = match load_active_user(&state).await {
-                Ok(u) => u,
+            let (user, refreshed_cookie) = match authenticate_session(&state, &headers).await {
+                Ok(Some(auth_res)) => auth_res,
+                Ok(None) => return unauthorized_json(&state),
                 Err(resp) => return resp,
             };
-            if !auth::is_authenticated(&headers, &user.user_secret) {
-                return json_error(StatusCode::UNAUTHORIZED, "Unauthorized");
-            }
 
             let req: DeleteLinkRequest = match serde_json::from_slice(&body) {
                 Ok(v) => v,
@@ -252,7 +473,8 @@ async fn handle_root_post(
 
             match state.db.delete_link(user.user_id, key).await {
                 Ok(Some(links)) => {
-                    (StatusCode::OK, Json(json!({ "links": links }))).into_response()
+                    let resp = (StatusCode::OK, Json(json!({ "links": links }))).into_response();
+                    with_set_cookie(resp, refreshed_cookie)
                 }
                 Ok(None) => json_error(StatusCode::NOT_FOUND, "Link not found."),
                 Err(err) => {
@@ -270,27 +492,31 @@ async fn handle_redirect(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let user = match load_active_user(&state).await {
-        Ok(u) => u,
+    let (user, refreshed_cookie) = match authenticate_session(&state, &headers).await {
+        Ok(Some(auth_res)) => auth_res,
+        Ok(None) => {
+            let next = uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
+            if let AuthMode::Oidc(oidc) = &state.auth_mode {
+                let sanitized = sanitize_next_path(Some(next));
+                return redirect_to_oidc_login(&state, oidc, &sanitized).await;
+            }
+            let encoded_next: String = form_urlencoded::byte_serialize(next.as_bytes()).collect();
+            return (
+                StatusCode::FOUND,
+                [(header::LOCATION, format!("/?next={encoded_next}"))],
+            )
+                .into_response();
+        }
         Err(resp) => return resp,
     };
 
-    if !auth::is_authenticated(&headers, &user.user_secret) {
-        let next = uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let encoded_next: String = form_urlencoded::byte_serialize(next.as_bytes()).collect();
-        return (
-            StatusCode::FOUND,
-            [(header::LOCATION, format!("/?next={encoded_next}"))],
-        )
-            .into_response();
-    }
-
     let trimmed = uri.path().strip_prefix('/').unwrap_or(uri.path());
     if trimmed.is_empty() {
-        return (StatusCode::FOUND, [(header::LOCATION, "/".to_string())]).into_response();
+        let resp = (StatusCode::FOUND, [(header::LOCATION, "/".to_string())]).into_response();
+        return with_set_cookie(resp, refreshed_cookie);
     }
 
     let (link_key_raw, rest_raw) = split_link_and_rest(trimmed);
@@ -304,11 +530,12 @@ async fn handle_redirect(
         Ok(Some(t)) => t,
         Ok(None) => {
             let encoded_key = utf8_percent_encode(link_key.as_ref(), NON_ALPHANUMERIC).to_string();
-            return (
+            let resp = (
                 StatusCode::FOUND,
                 [(header::LOCATION, format!("/#/edit/{encoded_key}"))],
             )
                 .into_response();
+            return with_set_cookie(resp, refreshed_cookie);
         }
         Err(err) => {
             eprintln!("Database error looking up link '{}': {err}", link_key);
@@ -327,7 +554,8 @@ async fn handle_redirect(
         template.replace("%s", &encoded_rest)
     };
 
-    (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+    let resp = (StatusCode::FOUND, [(header::LOCATION, target)]).into_response();
+    with_set_cookie(resp, refreshed_cookie)
 }
 
 /// Splits the request path on the first `/` or space separator (including `%20` / `%2F`).
@@ -457,15 +685,41 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let derived_secret = auth::derive_auth_token(&app_cfg.user_secret_key);
-    let user = match db.sync_user(&app_cfg.username, &derived_secret).await {
-        Ok(user) => user,
-        Err(err) => {
-            eprintln!("Startup failed: {err}");
-            std::process::exit(1);
+    let (auth_mode, auth_desc) = match app_cfg.auth {
+        AuthConfig::SingleUser {
+            username,
+            user_secret_key,
+        } => {
+            let derived_secret = auth::derive_auth_token(&user_secret_key);
+            let user = match db.sync_user(&username, &derived_secret).await {
+                Ok(user) => user,
+                Err(err) => {
+                    eprintln!("Startup failed: {err}");
+                    std::process::exit(1);
+                }
+            };
+            (
+                AuthMode::SingleUser {
+                    active_user_id: user.user_id,
+                },
+                format!("user={username}"),
+            )
+        }
+        AuthConfig::Oidc(oidc_cfg) => {
+            let issuer = oidc_cfg.issuer_url.clone();
+            let service = match OidcService::new(oidc_cfg) {
+                Ok(s) => Arc::new(s),
+                Err(err) => {
+                    eprintln!("Startup failed: {err}");
+                    std::process::exit(1);
+                }
+            };
+            service.warm_discovery().await;
+            (AuthMode::Oidc(service), format!("oidc={issuer}"))
         }
     };
 
+    let session_ttl_secs = app_cfg.session_ttl_days.saturating_mul(86_400);
     let addr = std::env::var("GOLINKS_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let secure_cookie = parse_bool_env("GOLINKS_SECURE_COOKIE", true);
     let favicon = match load_favicon_from_env() {
@@ -489,7 +743,8 @@ async fn main() {
 
     let state = AppState {
         db,
-        active_user_id: user.user_id,
+        auth_mode,
+        session_ttl_secs,
         secure_cookie,
         favicon,
         ui_html,
@@ -504,8 +759,8 @@ async fn main() {
     };
 
     eprintln!(
-        "Listening on {addr} (db={db_desc}, user={})",
-        app_cfg.username
+        "Listening on {addr} (db={db_desc}, {auth_desc}, session_ttl_days={})",
+        app_cfg.session_ttl_days
     );
     if let Err(err) = axum::serve(listener, build_router(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -524,6 +779,19 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    const TEST_SESSION_TTL_SECS: u64 = 30 * 86_400;
+
+    fn make_jwt_cookie(username: &str, raw_secret: &str) -> String {
+        let derived = auth::derive_auth_token(raw_secret);
+        let jwt = auth::sign_session_jwt(
+            username,
+            &derived,
+            auth::current_unix_secs(),
+            TEST_SESSION_TTL_SECS,
+        );
+        format!("golinks_auth={jwt}")
+    }
 
     async fn test_state(secure_cookie: bool) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -560,7 +828,10 @@ mod tests {
 
         let state = AppState {
             db,
-            active_user_id: user.user_id,
+            auth_mode: AuthMode::SingleUser {
+                active_user_id: user.user_id,
+            },
+            session_ttl_secs: TEST_SESSION_TTL_SECS,
             secure_cookie,
             favicon: default_favicon(),
             ui_html: Arc::new("<!DOCTYPE html><html><body>UI</body></html>".to_string()),
@@ -683,15 +954,22 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
         assert!(cookie.contains("Path=/"));
-        assert!(cookie.contains("Max-Age=157680000"));
+        assert!(cookie.contains("Max-Age=2592000"));
         assert!(cookie.contains("Secure"));
+        let jwt = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("golinks_auth=")
+            .unwrap();
+        let (claims, _, _) = auth::parse_unverified_jwt(jwt).expect("login sets valid JWT");
+        assert_eq!(claims.sub, "golinks");
     }
 
     #[tokio::test]
     async fn authenticated_redirects_url_encoding_and_unknown_redirect_to_edit() {
         let (state, _dir) = test_state(false).await;
-        let token = auth::derive_auth_token("someSuperSecretValue");
-        let cookie_hdr = format!("golinks_auth={token}");
+        let cookie_hdr = make_jwt_cookie("golinks", "someSuperSecretValue");
         let app = build_router(state);
 
         let cases = [
@@ -774,10 +1052,12 @@ mod tests {
     #[tokio::test]
     async fn api_get_save_rename_and_delete_links_persists_db() {
         let (state, dir) = test_state(false).await;
-        let user_id = state.active_user_id;
+        let user_id = match &state.auth_mode {
+            AuthMode::SingleUser { active_user_id } => *active_user_id,
+            AuthMode::Oidc(_) => unreachable!(),
+        };
         let db_path = dir.path().join("golinks.db");
-        let token = auth::derive_auth_token("someSuperSecretValue");
-        let cookie_hdr = format!("golinks_auth={token}");
+        let cookie_hdr = make_jwt_cookie("golinks", "someSuperSecretValue");
         let app = build_router(state);
 
         // getLinks
@@ -905,8 +1185,7 @@ mod tests {
     #[tokio::test]
     async fn validation_enforces_32_and_512_unicode_char_limits() {
         let (state, _dir) = test_state(false).await;
-        let token = auth::derive_auth_token("someSuperSecretValue");
-        let cookie_hdr = format!("golinks_auth={token}");
+        let cookie_hdr = make_jwt_cookie("golinks", "someSuperSecretValue");
         let app = build_router(state);
 
         let key_32 = "é".repeat(32);
@@ -983,8 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn redirect_returns_500_with_security_headers_on_db_error() {
         let (state, _dir) = test_state(false).await;
-        let token = auth::derive_auth_token("someSuperSecretValue");
-        let cookie_hdr = format!("golinks_auth={token}");
+        let cookie_hdr = make_jwt_cookie("golinks", "someSuperSecretValue");
 
         sqlx::query("DROP TABLE links")
             .execute(state.db.sqlite_pool())
@@ -1010,10 +1288,11 @@ mod tests {
     #[tokio::test]
     async fn secret_rotation_via_sync_user_invalidates_old_cookie() {
         let (state, _dir) = test_state(false).await;
-        let old_token = auth::derive_auth_token("someSuperSecretValue");
+        let old_cookie = make_jwt_cookie("golinks", "someSuperSecretValue");
         let new_token = auth::derive_auth_token("secondSecret");
 
         state.db.sync_user("golinks", &new_token).await.unwrap();
+        let new_cookie = make_jwt_cookie("golinks", "secondSecret");
 
         let app = build_router(state);
 
@@ -1022,7 +1301,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/docs")
-                    .header(header::COOKIE, format!("golinks_auth={old_token}"))
+                    .header(header::COOKIE, &old_cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1042,7 +1321,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/docs")
-                    .header(header::COOKIE, format!("golinks_auth={new_token}"))
+                    .header(header::COOKIE, &new_cookie)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1056,6 +1335,426 @@ mod tests {
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok()),
             Some("https://docs.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn single_user_jwt_sliding_window_and_rejects_expired_or_other_user_jwt() {
+        let (state, _dir) = test_state(false).await;
+        let derived = auth::derive_auth_token("someSuperSecretValue");
+
+        // Create another user "bob" in DB; bob's valid JWT must be rejected in single-user mode.
+        let bob_secret = auth::generate_random_user_secret();
+        state.db.get_or_create_user("bob", &bob_secret).await.unwrap();
+        let bob_jwt = auth::sign_session_jwt(
+            "bob",
+            &bob_secret,
+            auth::current_unix_secs(),
+            TEST_SESSION_TTL_SECS,
+        );
+
+        // Near-expiry valid JWT for "golinks" (exp = now + 60s)
+        let now = auth::current_unix_secs();
+        let short_jwt = auth::sign_session_jwt("golinks", &derived, now - 100, 160);
+        let (short_claims, _, _) = auth::parse_unverified_jwt(&short_jwt).unwrap();
+
+        // Expired JWT for "golinks"
+        let expired_jwt = auth::sign_session_jwt("golinks", &derived, now - 1000, 500);
+
+        let app = build_router(state);
+
+        // Sliding window refreshes Set-Cookie with exp > old_exp on getLinks and /docs
+        for uri in ["/?action=getLinks", "/docs"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::COOKIE, format!("golinks_auth={short_jwt}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let set_cookie = resp
+                .headers()
+                .get(header::SET_COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .expect("expected refreshed Set-Cookie");
+            let refreshed_jwt = set_cookie
+                .split(';')
+                .next()
+                .unwrap()
+                .strip_prefix("golinks_auth=")
+                .unwrap();
+            let (new_claims, _, _) = auth::parse_unverified_jwt(refreshed_jwt).unwrap();
+            assert!(
+                new_claims.exp > short_claims.exp,
+                "expected sliding window exp to advance for {uri}"
+            );
+        }
+
+        // Expired JWT rejected
+        let expired_api = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?action=getLinks")
+                    .header(header::COOKIE, format!("golinks_auth={expired_jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_api.status(), StatusCode::UNAUTHORIZED);
+
+        // Other user's valid JWT rejected in single-user mode
+        let bob_api = app
+            .oneshot(
+                Request::builder()
+                    .uri("/?action=getLinks")
+                    .header(header::COOKIE, format!("golinks_auth={bob_jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bob_api.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn oidc_test_state() -> (
+        AppState,
+        crate::oidc::test_support::MockOidcServer,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("golinks_oidc.db");
+        let db = Database::connect(&DbConfig::Sqlite {
+            path: db_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap();
+        db.run_migrations().await.unwrap();
+
+        let server = crate::oidc::test_support::MockOidcServer::start("golinks-client").await;
+        let cfg = server.oidc_config("golinks-client", "oidc-secret", "https://go.example.com/");
+        let service = Arc::new(crate::oidc::OidcService::new(cfg).unwrap());
+
+        let state = AppState {
+            db,
+            auth_mode: AuthMode::Oidc(service),
+            session_ttl_secs: TEST_SESSION_TTL_SECS,
+            secure_cookie: false,
+            favicon: default_favicon(),
+            ui_html: Arc::new("<!DOCTYPE html><html><body>UI</body></html>".to_string()),
+        };
+        (state, server, dir)
+    }
+
+    #[tokio::test]
+    async fn oidc_unauthenticated_root_and_keyword_redirect_directly_to_provider() {
+        let (state, server, _dir) = oidc_test_state().await;
+        let app = build_router(state);
+
+        // GET / redirects directly to OIDC provider
+        let root_resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root_resp.status(), StatusCode::FOUND);
+        assert_security_headers(root_resp.headers());
+        let loc = root_resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(loc.starts_with(&format!("{}/authorize", server.issuer_url)));
+        let state_cookie = root_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(state_cookie.contains("golinks_oidc_state="));
+
+        // GET /docs redirects directly to OIDC provider
+        let docs_resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(docs_resp.status(), StatusCode::FOUND);
+        assert!(
+            docs_resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(&format!("{}/authorize", server.issuer_url))
+        );
+
+        // GET /?action=getLinks returns 401 with oidcEnabled: true
+        let api_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?action=getLinks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_resp.status(), StatusCode::UNAUTHORIZED);
+        let api_body: serde_json::Value =
+            serde_json::from_str(&body_text(api_resp).await).unwrap();
+        assert_eq!(api_body["oidcEnabled"], true);
+
+        // POST /?action=login is disabled (403)
+        let login_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"secret":"anything"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_provisions_users_preserves_secret_and_isolates_links() {
+        use crate::oidc::test_support::{MockUserBehavior, extract_query_param};
+
+        let (state, server, _dir) = oidc_test_state().await;
+        let db = state.db.clone();
+        let app = build_router(state);
+
+        // Helper to complete an OIDC login flow targeting `initial_uri`
+        let complete_login = |initial_uri: String, code: String, behavior_user: String, in_id: bool| {
+            let app = app.clone();
+            let server_ref = &server;
+            async move {
+                let start_resp = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(&initial_uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(start_resp.status(), StatusCode::FOUND);
+                let auth_url = start_resp
+                    .headers()
+                    .get(header::LOCATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let state_cookie = start_resp
+                    .headers()
+                    .get(header::SET_COOKIE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let state_param = extract_query_param(&auth_url, "state").unwrap();
+                let nonce = extract_query_param(&auth_url, "nonce").unwrap();
+
+                server_ref.register_code(
+                    &code,
+                    MockUserBehavior {
+                        username: behavior_user,
+                        include_in_id_token: in_id,
+                        include_in_userinfo: !in_id,
+                        nonce,
+                    },
+                );
+
+                let cb_resp = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/?code={code}&state={state_param}"))
+                            .header(header::COOKIE, state_cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(cb_resp.status(), StatusCode::FOUND);
+                assert_security_headers(cb_resp.headers());
+                let redirect_to = cb_resp
+                    .headers()
+                    .get(header::LOCATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let mut auth_cookie = None;
+                let mut cleared_state = false;
+                for val in cb_resp.headers().get_all(header::SET_COOKIE) {
+                    let s = val.to_str().unwrap();
+                    if s.starts_with("golinks_auth=") {
+                        auth_cookie = Some(s.split(';').next().unwrap().to_string());
+                    } else if s.starts_with("golinks_oidc_state=") && s.contains("Max-Age=0") {
+                        cleared_state = true;
+                    }
+                }
+                assert!(cleared_state, "expected golinks_oidc_state to be cleared");
+                (auth_cookie.expect("expected golinks_auth cookie"), redirect_to)
+            }
+        };
+
+        // 1. Alice logs in targeting /docs (claim in ID token)
+        let (alice_cookie, alice_next) =
+            complete_login("/docs".into(), "code-a1".into(), "alice".into(), true).await;
+        assert_eq!(alice_next, "/docs");
+        let alice_user = db.get_user_by_name("alice").await.unwrap().unwrap();
+        assert_eq!(alice_user.user_secret.len(), 64);
+
+        // 2. Alice logs in again -> user_secret preserved; open-redirect next=//evil.com sanitized to /
+        let (_alice_cookie2, sanitized_next) =
+            complete_login("/?next=//evil.com".into(), "code-a2".into(), "alice".into(), true)
+                .await;
+        assert_eq!(sanitized_next, "/");
+        let alice_user2 = db.get_user_by_name("alice").await.unwrap().unwrap();
+        assert_eq!(alice_user2.user_secret, alice_user.user_secret);
+
+        // 3. Bob logs in (claim via userinfo fallback)
+        let (bob_cookie, bob_next) =
+            complete_login("/".into(), "code-b1".into(), "bob".into(), false).await;
+        assert_eq!(bob_next, "/");
+        let bob_user = db.get_user_by_name("bob").await.unwrap().unwrap();
+        assert_ne!(bob_user.user_secret, alice_user.user_secret);
+
+        // 4. Alice and Bob save conflicting link keyword "docs" -> strictly isolated
+        let save_alice = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &alice_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":"docs","target":"https://alice.example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_alice.status(), StatusCode::OK);
+        assert!(save_alice.headers().get(header::SET_COOKIE).is_some());
+
+        let save_bob = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &bob_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":"docs","target":"https://bob.example.com"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_bob.status(), StatusCode::OK);
+
+        let alice_go = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/docs")
+                    .header(header::COOKIE, &alice_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_go.headers().get(header::LOCATION).unwrap(),
+            "https://alice.example.com"
+        );
+        assert!(alice_go.headers().get(header::SET_COOKIE).is_some());
+
+        let bob_go = app
+            .oneshot(
+                Request::builder()
+                    .uri("/docs")
+                    .header(header::COOKIE, &bob_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_go.headers().get(header::LOCATION).unwrap(),
+            "https://bob.example.com"
+        );
+        assert!(bob_go.headers().get(header::SET_COOKIE).is_some());
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_errors_do_not_loop() {
+        let (state, _server, _dir) = oidc_test_state().await;
+        let app = build_router(state);
+
+        // Provider error param returns 401 (no redirect loop) and clears state cookie
+        let err_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/?error=access_denied&state=abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(err_resp.status(), StatusCode::UNAUTHORIZED);
+        assert_security_headers(err_resp.headers());
+        assert!(
+            err_resp
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+
+        // Mismatched/missing state cookie returns 400 and clears state cookie
+        let bad_state = app
+            .oneshot(
+                Request::builder()
+                    .uri("/?code=abc&state=wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_state.status(), StatusCode::BAD_REQUEST);
+        assert_security_headers(bad_state.headers());
+        assert!(
+            bad_state
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
         );
     }
 

@@ -1,0 +1,1 @@
+ALTER TABLE golinks.users ALTER COLUMN user_name TYPE VARCHAR(255);
