@@ -1,6 +1,7 @@
 pub mod config;
 pub mod migrations;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -8,6 +9,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{PgPool, SqlitePool};
 
+use crate::auth;
 use crate::db::config::DbConfig;
 
 /// Database and migration error type.
@@ -43,6 +45,24 @@ impl std::error::Error for DbError {
 impl From<sqlx::Error> for DbError {
     fn from(err: sqlx::Error) -> Self {
         Self::Sqlx(err)
+    }
+}
+
+/// User record stored in the `users` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct User {
+    pub user_id: i32,
+    pub user_name: String,
+    pub user_secret: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn user_from_row((user_id, user_name, user_secret): (i32, String, String)) -> User {
+    User {
+        user_id,
+        user_name,
+        user_secret,
     }
 }
 
@@ -138,11 +158,555 @@ impl Database {
         }
     }
 
+    /// Creates a user if absent, or updates `user_secret` if it changed.
+    pub async fn sync_user(&self, user_name: &str, user_secret: &str) -> Result<User, DbError> {
+        if let Some(existing) = self.get_user_by_name(user_name).await? {
+            if auth::constant_time_eq(&existing.user_secret, user_secret) {
+                return Ok(existing);
+            }
+
+            let row = match &self.backend {
+                Backend::Sqlite(pool) => {
+                    sqlx::query_as::<_, (i32, String, String)>(
+                        "UPDATE users SET user_secret = ?, updated_on = CURRENT_TIMESTAMP \
+                         WHERE user_id = ? \
+                         RETURNING user_id, user_name, user_secret",
+                    )
+                    .bind(user_secret)
+                    .bind(existing.user_id)
+                    .fetch_one(pool)
+                    .await?
+                }
+                Backend::Postgres(pool) => {
+                    sqlx::query_as::<_, (i32, String, String)>(
+                        "UPDATE users SET user_secret = $1, updated_on = CURRENT_TIMESTAMP \
+                         WHERE user_id = $2 \
+                         RETURNING user_id, user_name, user_secret",
+                    )
+                    .bind(user_secret)
+                    .bind(existing.user_id)
+                    .fetch_one(pool)
+                    .await?
+                }
+            };
+            return Ok(user_from_row(row));
+        }
+
+        let row = match &self.backend {
+            Backend::Sqlite(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "INSERT INTO users (user_name, user_secret) VALUES (?, ?) \
+                     RETURNING user_id, user_name, user_secret",
+                )
+                .bind(user_name)
+                .bind(user_secret)
+                .fetch_one(pool)
+                .await?
+            }
+            Backend::Postgres(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "INSERT INTO users (user_name, user_secret) VALUES ($1, $2) \
+                     RETURNING user_id, user_name, user_secret",
+                )
+                .bind(user_name)
+                .bind(user_secret)
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        Ok(user_from_row(row))
+    }
+
+    /// Fetches a user by primary key `user_id`.
+    pub async fn get_user_by_id(&self, user_id: i32) -> Result<Option<User>, DbError> {
+        let row = match &self.backend {
+            Backend::Sqlite(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "SELECT user_id, user_name, user_secret FROM users WHERE user_id = ?",
+                )
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?
+            }
+            Backend::Postgres(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "SELECT user_id, user_name, user_secret FROM users WHERE user_id = $1",
+                )
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        Ok(row.map(user_from_row))
+    }
+
+    /// Fetches a user by unique `user_name`.
+    pub async fn get_user_by_name(&self, user_name: &str) -> Result<Option<User>, DbError> {
+        let row = match &self.backend {
+            Backend::Sqlite(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "SELECT user_id, user_name, user_secret FROM users WHERE user_name = ?",
+                )
+                .bind(user_name)
+                .fetch_optional(pool)
+                .await?
+            }
+            Backend::Postgres(pool) => {
+                sqlx::query_as::<_, (i32, String, String)>(
+                    "SELECT user_id, user_name, user_secret FROM users WHERE user_name = $1",
+                )
+                .bind(user_name)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        Ok(row.map(user_from_row))
+    }
+
+    /// Lists all links belonging to `user_id`, ordered by keyword.
+    pub async fn list_links(&self, user_id: i32) -> Result<BTreeMap<String, String>, DbError> {
+        let rows = match &self.backend {
+            Backend::Sqlite(pool) => {
+                sqlx::query_as::<_, (String, String)>(
+                    "SELECT link_keyword, link_target FROM links \
+                     WHERE user_id = ? ORDER BY link_keyword ASC",
+                )
+                .bind(user_id)
+                .fetch_all(pool)
+                .await?
+            }
+            Backend::Postgres(pool) => {
+                sqlx::query_as::<_, (String, String)>(
+                    "SELECT link_keyword, link_target FROM links \
+                     WHERE user_id = $1 ORDER BY link_keyword ASC",
+                )
+                .bind(user_id)
+                .fetch_all(pool)
+                .await?
+            }
+        };
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Looks up a single link target for `user_id` and `keyword`.
+    pub async fn get_link_target(
+        &self,
+        user_id: i32,
+        keyword: &str,
+    ) -> Result<Option<String>, DbError> {
+        let target = match &self.backend {
+            Backend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT link_target FROM links WHERE user_id = ? AND link_keyword = ?",
+                )
+                .bind(user_id)
+                .bind(keyword)
+                .fetch_optional(pool)
+                .await?
+            }
+            Backend::Postgres(pool) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT link_target FROM links WHERE user_id = $1 AND link_keyword = $2",
+                )
+                .bind(user_id)
+                .bind(keyword)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        Ok(target)
+    }
+
+    /// Atomically creates, updates, or renames a link for `user_id`, returning the updated map.
+    pub async fn save_link(
+        &self,
+        user_id: i32,
+        original_key: Option<&str>,
+        key: &str,
+        target: &str,
+    ) -> Result<BTreeMap<String, String>, DbError> {
+        let rename_from = original_key
+            .map(str::trim)
+            .filter(|orig| !orig.is_empty() && *orig != key);
+
+        match &self.backend {
+            Backend::Sqlite(pool) => {
+                let mut tx = pool.begin().await?;
+                if let Some(orig) = rename_from {
+                    sqlx::query("DELETE FROM links WHERE user_id = ? AND link_keyword = ?")
+                        .bind(user_id)
+                        .bind(orig)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query(
+                    "INSERT INTO links (user_id, link_keyword, link_target) VALUES (?, ?, ?) \
+                     ON CONFLICT (user_id, link_keyword) \
+                     DO UPDATE SET link_target = EXCLUDED.link_target, updated_on = CURRENT_TIMESTAMP",
+                )
+                .bind(user_id)
+                .bind(key)
+                .bind(target)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            }
+            Backend::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                if let Some(orig) = rename_from {
+                    sqlx::query("DELETE FROM links WHERE user_id = $1 AND link_keyword = $2")
+                        .bind(user_id)
+                        .bind(orig)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query(
+                    "INSERT INTO links (user_id, link_keyword, link_target) VALUES ($1, $2, $3) \
+                     ON CONFLICT (user_id, link_keyword) \
+                     DO UPDATE SET link_target = EXCLUDED.link_target, updated_on = CURRENT_TIMESTAMP",
+                )
+                .bind(user_id)
+                .bind(key)
+                .bind(target)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            }
+        }
+
+        self.list_links(user_id).await
+    }
+
+    /// Deletes a link for `user_id` by `keyword`, returning `None` if no row was deleted.
+    pub async fn delete_link(
+        &self,
+        user_id: i32,
+        keyword: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, DbError> {
+        let rows_affected = match &self.backend {
+            Backend::Sqlite(pool) => {
+                sqlx::query("DELETE FROM links WHERE user_id = ? AND link_keyword = ?")
+                    .bind(user_id)
+                    .bind(keyword)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+            Backend::Postgres(pool) => {
+                sqlx::query("DELETE FROM links WHERE user_id = $1 AND link_keyword = $2")
+                    .bind(user_id)
+                    .bind(keyword)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+        };
+
+        if rows_affected == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(self.list_links(user_id).await?))
+    }
+
     #[cfg(test)]
     pub(crate) fn sqlite_pool(&self) -> &SqlitePool {
         match &self.backend {
             Backend::Sqlite(pool) => pool,
             Backend::Postgres(_) => panic!("expected SQLite backend"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use crate::auth::derive_auth_token;
+
+    async fn setup_memory_db() -> Database {
+        let db = Database::connect(&DbConfig::Sqlite {
+            path: ":memory:".to_string(),
+        })
+        .await
+        .expect("connect to in-memory sqlite");
+        db.run_migrations().await.expect("run migrations");
+        db
+    }
+
+    #[tokio::test]
+    async fn sync_user_creates_preserves_and_updates_secret() {
+        let db = setup_memory_db().await;
+        let secret1 = derive_auth_token("initial-secret");
+        let secret2 = derive_auth_token("rotated-secret");
+
+        let created = db
+            .sync_user("golinks", &secret1)
+            .await
+            .expect("create user");
+        assert!(created.user_id > 0);
+        assert_eq!(created.user_name, "golinks");
+        assert_eq!(created.user_secret, secret1);
+
+        let preserved = db
+            .sync_user("golinks", &secret1)
+            .await
+            .expect("preserve user");
+        assert_eq!(preserved, created);
+
+        let updated = db
+            .sync_user("golinks", &secret2)
+            .await
+            .expect("update user secret");
+        assert_eq!(updated.user_id, created.user_id);
+        assert_eq!(updated.user_name, "golinks");
+        assert_eq!(updated.user_secret, secret2);
+
+        let by_id = db
+            .get_user_by_id(created.user_id)
+            .await
+            .expect("get_user_by_id");
+        assert_eq!(by_id, Some(updated.clone()));
+
+        let by_name = db
+            .get_user_by_name("golinks")
+            .await
+            .expect("get_user_by_name");
+        assert_eq!(by_name, Some(updated));
+
+        assert_eq!(
+            db.get_user_by_id(created.user_id + 999)
+                .await
+                .expect("missing user by id"),
+            None
+        );
+        assert_eq!(
+            db.get_user_by_name("nobody")
+                .await
+                .expect("missing user by name"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn save_rename_overwrite_and_delete_links() {
+        let db = setup_memory_db().await;
+        let secret = derive_auth_token("test-secret");
+        let user = db.sync_user("golinks", &secret).await.expect("sync user");
+        let uid = user.user_id;
+
+        let links = db
+            .save_link(uid, None, "docs", "https://docs.example.com")
+            .await
+            .expect("insert docs");
+        assert_eq!(
+            links,
+            BTreeMap::from([("docs".to_string(), "https://docs.example.com".to_string())])
+        );
+
+        let links = db
+            .save_link(uid, None, "gh", "https://github.com/%s")
+            .await
+            .expect("insert gh");
+        assert_eq!(
+            links,
+            BTreeMap::from([
+                ("docs".to_string(), "https://docs.example.com".to_string()),
+                ("gh".to_string(), "https://github.com/%s".to_string()),
+            ])
+        );
+
+        // Rename "gh" onto existing key "docs" atomically removes "gh" and overwrites "docs".
+        let links = db
+            .save_link(uid, Some("gh"), "docs", "https://new-docs.example.com")
+            .await
+            .expect("rename gh onto docs");
+        assert_eq!(
+            links,
+            BTreeMap::from([(
+                "docs".to_string(),
+                "https://new-docs.example.com".to_string()
+            )])
+        );
+
+        assert_eq!(
+            db.get_link_target(uid, "docs")
+                .await
+                .expect("get docs target"),
+            Some("https://new-docs.example.com".to_string())
+        );
+        assert_eq!(
+            db.get_link_target(uid, "gh").await.expect("get gh target"),
+            None
+        );
+
+        assert_eq!(
+            db.delete_link(uid, "missing")
+                .await
+                .expect("delete missing"),
+            None
+        );
+
+        assert_eq!(
+            db.delete_link(uid, "docs").await.expect("delete docs"),
+            Some(BTreeMap::new())
+        );
+        assert_eq!(db.list_links(uid).await.expect("list empty"), BTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn multi_user_link_isolation() {
+        let db = setup_memory_db().await;
+        let alice = db
+            .sync_user("alice", &derive_auth_token("alice-secret"))
+            .await
+            .expect("sync alice");
+        let bob = db
+            .sync_user("bob", &derive_auth_token("bob-secret"))
+            .await
+            .expect("sync bob");
+        assert_ne!(alice.user_id, bob.user_id);
+
+        db.save_link(alice.user_id, None, "docs", "https://alice.example.com/docs")
+            .await
+            .expect("insert alice docs");
+        db.save_link(bob.user_id, None, "docs", "https://bob.example.com/docs")
+            .await
+            .expect("insert bob docs");
+
+        assert_eq!(
+            db.list_links(alice.user_id).await.expect("list alice"),
+            BTreeMap::from([(
+                "docs".to_string(),
+                "https://alice.example.com/docs".to_string()
+            )])
+        );
+        assert_eq!(
+            db.list_links(bob.user_id).await.expect("list bob"),
+            BTreeMap::from([(
+                "docs".to_string(),
+                "https://bob.example.com/docs".to_string()
+            )])
+        );
+
+        assert_eq!(
+            db.get_link_target(alice.user_id, "docs")
+                .await
+                .expect("get alice docs"),
+            Some("https://alice.example.com/docs".to_string())
+        );
+        assert_eq!(
+            db.get_link_target(bob.user_id, "docs")
+                .await
+                .expect("get bob docs"),
+            Some("https://bob.example.com/docs".to_string())
+        );
+
+        // Alice updates & renames her link; Bob's link must remain untouched.
+        db.save_link(
+            alice.user_id,
+            Some("docs"),
+            "notes",
+            "https://alice.example.com/notes",
+        )
+        .await
+        .expect("rename alice docs -> notes");
+
+        assert_eq!(
+            db.list_links(alice.user_id).await.expect("list alice after rename"),
+            BTreeMap::from([(
+                "notes".to_string(),
+                "https://alice.example.com/notes".to_string()
+            )])
+        );
+        assert_eq!(
+            db.list_links(bob.user_id).await.expect("list bob after alice rename"),
+            BTreeMap::from([(
+                "docs".to_string(),
+                "https://bob.example.com/docs".to_string()
+            )])
+        );
+
+        // Alice deletes her link; Bob's link must still be untouched.
+        assert_eq!(
+            db.delete_link(alice.user_id, "notes")
+                .await
+                .expect("delete alice notes"),
+            Some(BTreeMap::new())
+        );
+        assert_eq!(
+            db.delete_link(alice.user_id, "docs")
+                .await
+                .expect("delete alice missing docs"),
+            None
+        );
+        assert_eq!(
+            db.get_link_target(bob.user_id, "docs")
+                .await
+                .expect("bob docs still present"),
+            Some("https://bob.example.com/docs".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_postgres_end_to_end() {
+        let Ok(host) = std::env::var("GOLINKS_TEST_PG_HOST") else {
+            return;
+        };
+        if host.trim().is_empty() {
+            return;
+        }
+
+        let port = std::env::var("GOLINKS_TEST_PG_PORT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(5432);
+        let database = std::env::var("GOLINKS_TEST_PG_NAME")
+            .or_else(|_| std::env::var("GOLINKS_TEST_PG_DATABASE"))
+            .unwrap_or_else(|_| "golinks".to_string());
+        let username = std::env::var("GOLINKS_TEST_PG_USERNAME")
+            .unwrap_or_else(|_| "golinks".to_string());
+        let password = std::env::var("GOLINKS_TEST_PG_PASSWORD").unwrap_or_default();
+
+        let db = Database::connect(&DbConfig::Postgresql {
+            host,
+            port,
+            database,
+            username,
+            password,
+        })
+        .await
+        .expect("connect to postgres");
+        db.run_migrations().await.expect("run postgres migrations");
+
+        let user = db
+            .sync_user("pg_e2e_user", &derive_auth_token("pg-e2e-secret"))
+            .await
+            .expect("sync postgres user");
+        assert!(user.user_id > 0);
+
+        let links = db
+            .save_link(user.user_id, None, "docs", "https://docs.example.com")
+            .await
+            .expect("save postgres link");
+        assert_eq!(
+            links.get("docs").map(String::as_str),
+            Some("https://docs.example.com")
+        );
+
+        assert_eq!(
+            db.get_link_target(user.user_id, "docs")
+                .await
+                .expect("get postgres link target"),
+            Some("https://docs.example.com".to_string())
+        );
+
+        let remaining = db
+            .delete_link(user.user_id, "docs")
+            .await
+            .expect("delete postgres link")
+            .expect("deleted row");
+        assert!(!remaining.contains_key("docs"));
     }
 }
