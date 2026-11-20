@@ -14,11 +14,9 @@ use crate::db::config::DbConfig;
 
 /// Database and migration error type.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum DbError {
     Sqlx(sqlx::Error),
     Migration(String),
-    Config(String),
     Io(String),
 }
 
@@ -27,7 +25,6 @@ impl fmt::Display for DbError {
         match self {
             Self::Sqlx(err) => write!(f, "database error: {err}"),
             Self::Migration(msg) => write!(f, "migration error: {msg}"),
-            Self::Config(msg) => write!(f, "database config error: {msg}"),
             Self::Io(msg) => write!(f, "database I/O error: {msg}"),
         }
     }
@@ -37,7 +34,7 @@ impl std::error::Error for DbError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlx(err) => Some(err),
-            Self::Migration(_) | Self::Config(_) | Self::Io(_) => None,
+            Self::Migration(_) | Self::Io(_) => None,
         }
     }
 }
@@ -156,56 +153,66 @@ impl Database {
 
     /// Creates a user if absent, or updates `user_secret` if it changed.
     pub async fn sync_user(&self, user_name: &str, user_secret: &str) -> Result<User, DbError> {
-        if let Some(existing) = self.get_user_by_name(user_name).await? {
-            if auth::constant_time_eq(&existing.user_secret, user_secret) {
-                return Ok(existing);
+        let existing = match self.get_user_by_name(user_name).await? {
+            Some(user) => user,
+            None => {
+                let inserted = match &self.backend {
+                    Backend::Sqlite(pool) => {
+                        sqlx::query_as::<_, (i32, String, String)>(
+                            "INSERT INTO users (user_name, user_secret) VALUES (?, ?) \
+                             ON CONFLICT (user_name) DO NOTHING \
+                             RETURNING user_id, user_name, user_secret",
+                        )
+                        .bind(user_name)
+                        .bind(user_secret)
+                        .fetch_optional(pool)
+                        .await?
+                    }
+                    Backend::Postgres(pool) => {
+                        sqlx::query_as::<_, (i32, String, String)>(
+                            "INSERT INTO users (user_name, user_secret) VALUES ($1, $2) \
+                             ON CONFLICT (user_name) DO NOTHING \
+                             RETURNING user_id, user_name, user_secret",
+                        )
+                        .bind(user_name)
+                        .bind(user_secret)
+                        .fetch_optional(pool)
+                        .await?
+                    }
+                };
+                if let Some(row) = inserted {
+                    return Ok(user_from_row(row));
+                }
+                self.get_user_by_name(user_name)
+                    .await?
+                    .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))?
             }
+        };
 
-            let row = match &self.backend {
-                Backend::Sqlite(pool) => {
-                    sqlx::query_as::<_, (i32, String, String)>(
-                        "UPDATE users SET user_secret = ?, updated_on = CURRENT_TIMESTAMP \
-                         WHERE user_id = ? \
-                         RETURNING user_id, user_name, user_secret",
-                    )
-                    .bind(user_secret)
-                    .bind(existing.user_id)
-                    .fetch_one(pool)
-                    .await?
-                }
-                Backend::Postgres(pool) => {
-                    sqlx::query_as::<_, (i32, String, String)>(
-                        "UPDATE users SET user_secret = $1, updated_on = CURRENT_TIMESTAMP \
-                         WHERE user_id = $2 \
-                         RETURNING user_id, user_name, user_secret",
-                    )
-                    .bind(user_secret)
-                    .bind(existing.user_id)
-                    .fetch_one(pool)
-                    .await?
-                }
-            };
-            return Ok(user_from_row(row));
+        if auth::constant_time_eq(&existing.user_secret, user_secret) {
+            return Ok(existing);
         }
 
         let row = match &self.backend {
             Backend::Sqlite(pool) => {
                 sqlx::query_as::<_, (i32, String, String)>(
-                    "INSERT INTO users (user_name, user_secret) VALUES (?, ?) \
+                    "UPDATE users SET user_secret = ?, updated_on = CURRENT_TIMESTAMP \
+                     WHERE user_id = ? \
                      RETURNING user_id, user_name, user_secret",
                 )
-                .bind(user_name)
                 .bind(user_secret)
+                .bind(existing.user_id)
                 .fetch_one(pool)
                 .await?
             }
             Backend::Postgres(pool) => {
                 sqlx::query_as::<_, (i32, String, String)>(
-                    "INSERT INTO users (user_name, user_secret) VALUES ($1, $2) \
+                    "UPDATE users SET user_secret = $1, updated_on = CURRENT_TIMESTAMP \
+                     WHERE user_id = $2 \
                      RETURNING user_id, user_name, user_secret",
                 )
-                .bind(user_name)
                 .bind(user_secret)
+                .bind(existing.user_id)
                 .fetch_one(pool)
                 .await?
             }
@@ -483,6 +490,45 @@ mod tests {
                 .expect("missing user by name"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn sync_user_handles_concurrent_startup_insert() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("concurrent_sync_user.db");
+        let db = Database::connect(&DbConfig::Sqlite {
+            path: db_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .expect("connect to file-backed sqlite");
+        db.run_migrations().await.expect("run migrations");
+
+        let secret = derive_auth_token("concurrent-secret");
+        let (r1, r2, r3, r4) = tokio::join!(
+            db.sync_user("golinks", &secret),
+            db.sync_user("golinks", &secret),
+            db.sync_user("golinks", &secret),
+            db.sync_user("golinks", &secret),
+        );
+
+        let u1 = r1.expect("concurrent sync_user 1");
+        let u2 = r2.expect("concurrent sync_user 2");
+        let u3 = r3.expect("concurrent sync_user 3");
+        let u4 = r4.expect("concurrent sync_user 4");
+
+        assert!(u1.user_id > 0);
+        assert_eq!(u1, u2);
+        assert_eq!(u1, u3);
+        assert_eq!(u1, u4);
+        assert_eq!(u1.user_name, "golinks");
+        assert_eq!(u1.user_secret, secret);
+
+        let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE user_name = ?")
+            .bind("golinks")
+            .fetch_one(db.sqlite_pool())
+            .await
+            .expect("count users");
+        assert_eq!(user_count, 1);
     }
 
     #[tokio::test]

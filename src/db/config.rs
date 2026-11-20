@@ -90,9 +90,15 @@ impl AppConfig {
             DbEngine::Postgresql => {
                 let host = require_non_empty_trimmed(&lookup, "GOLINKS_DB_HOST")?;
                 let port = match lookup("GOLINKS_DB_PORT") {
-                    Some(raw) => raw.trim().parse::<u16>().map_err(|err| {
-                        format!("invalid GOLINKS_DB_PORT '{raw}': {err}")
-                    })?,
+                    Some(raw) => {
+                        let parsed = raw.trim().parse::<u16>().map_err(|err| {
+                            format!("invalid GOLINKS_DB_PORT '{raw}': {err}")
+                        })?;
+                        if parsed == 0 {
+                            return Err("GOLINKS_DB_PORT must be between 1 and 65535".to_string());
+                        }
+                        parsed
+                    }
                     None => DEFAULT_POSTGRES_PORT,
                 };
                 let database = require_non_empty_trimmed(&lookup, "GOLINKS_DB_NAME")?;
@@ -229,6 +235,22 @@ mod tests {
             ("GOLINKS_DB_USERNAME", "app"),
             ("GOLINKS_DB_PASSWORD", "pw"),
         ]).is_err());
+
+        // Port 0 fails
+        let zero_port_err = parse(&[
+            ("GOLINKS_USER_SECRET_KEY", "ok"),
+            ("GOLINKS_DB_ENGINE", "postgresql"),
+            ("GOLINKS_DB_HOST", "db.example.com"),
+            ("GOLINKS_DB_PORT", "0"),
+            ("GOLINKS_DB_NAME", "golinks"),
+            ("GOLINKS_DB_USERNAME", "app"),
+            ("GOLINKS_DB_PASSWORD", "pw"),
+        ])
+        .unwrap_err();
+        assert!(
+            zero_port_err.contains("GOLINKS_DB_PORT"),
+            "unexpected error for port 0: {zero_port_err}"
+        );
     }
 
     #[test]

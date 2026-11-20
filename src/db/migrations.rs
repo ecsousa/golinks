@@ -160,6 +160,10 @@ pub async fn run_postgres_migrations(
         .execute(&mut *conn)
         .await;
 
+    if unlock_result.is_err() {
+        let _ = conn.close().await;
+    }
+
     match result {
         Ok(()) => {
             unlock_result?;
