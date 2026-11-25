@@ -9,7 +9,7 @@ A lightweight, self-hosted "go links" HTTP redirect service written in Rust with
 - **React management UI on `/`:** Sign in, browse/filter links, create new links, edit/rename keywords, and delete links—all served from `/` using `HashRouter` and `?action=...` API endpoints so link keywords never collide with UI or API routes.
 - **Quick create for unknown links:** Visiting an unknown keyword while authenticated redirects to `/#/edit/<keyword>` with the keyword pre-filled so you can save it immediately.
 - **SQLite & PostgreSQL storage:** Stores users and links in SQLite (zero-config default with WAL mode) or PostgreSQL (dedicated `golinks` schema), with embedded schema initialization and automatic migrations on startup.
-- **Flexible `%s` substitution:** Supports both `/` and space as the separator between the link key and parameter, with `application/x-www-form-urlencoded` encoding for the parameter.
+- **Flexible `%s` substitution:** Uses space as the separator between the link keyword and parameter (allowing `/` inside keywords such as `docs/api`), with `application/x-www-form-urlencoded` encoding for the parameter.
 - **Security headers on all responses:** `Referrer-Policy: no-referrer`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`.
 
 ## Configuration
@@ -106,8 +106,8 @@ Any standards-compliant OIDC provider (Keycloak, Authelia, Pocket ID, Okta, Goog
    - **URL:** `https://go.example.com/%s`
 3. Type in the address bar:
    - `go docs` → `https://docs.example.com`
-   - `go google/use curl/wget` → `https://www.google.com/search?q=use+curl%2Fwget`
    - `go google use curl/wget` → `https://www.google.com/search?q=use+curl%2Fwget`
+   - `go docs/api auth` → substitutes `auth` into the `docs/api` link target
    - `go newlink` (not yet defined) → opens `/#/edit/newlink` to create it
 
 On the first visit, you'll be redirected to `/?next=...` to enter your configured `GOLINKS_USER_SECRET_KEY`, after which the `HttpOnly` cookie is stored and you're redirected straight to your requested link.
