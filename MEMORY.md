@@ -18,24 +18,24 @@ Living project memory, design decisions, and current state for `golinks`.
 - **Unauthenticated `GET /<anything>`:**
   - Single-user mode: redirects (`302 Found`) to `/?next=<url-encoded path_and_query>`.
   - OIDC mode: redirects (`302 Found`) directly to the OIDC provider with `next` preserved in `golinks_oidc_state`.
-- **Authenticated `GET /<keyword>[/<param> | <param>]`:**
+- **Authenticated `GET /<keyword>[ <param>]`:**
   - Validates the `golinks_auth` HS256 JWT cookie (`sub` -> DB user lookup -> constant-time HMAC-SHA256 verification against non-empty `user.user_secret`, plus `user_id == active_user_id` in single-user mode), looks up `link_target` in `links` scoped by `user.user_id`, and attaches a refreshed `Set-Cookie` (sliding window).
-  - Splits on the earliest separator among `/`, `%20`, ` `, `%2F`, `%2f` so both `go google/use curl/wget` and `go google use curl/wget` work identically.
-  - **Link found, no `%s`:** Redirects (`302 Found`) directly to the target, ignoring trailing slashes and any extra segments.
+  - Splits on the earliest space separator (`%20` or literal space) only—`/` is allowed inside keywords (e.g., `key1/subitem something else` resolves keyword `key1/subitem` with substitution `something else`).
+  - **Link found, no `%s`:** Redirects (`302 Found`) directly to the target, ignoring any space-separated remainder.
   - **Link found, contains `%s`:** Percent-decodes the remainder, encodes it with `form_urlencoded::byte_serialize` (spaces → `+`, `/` → `%2F`), and substitutes `%s` (or `""` if no remainder was given).
   - **Link not found:** Redirects (`302 Found`) to `/#/edit/<percent-encoded keyword>` so the user can immediately create it.
 
 ### 2. Backend API Contract (all on `/`)
 - `GET /?action=getLinks` *(auth required)* → validates `golinks_auth` JWT, queries `links` for `user.user_id`, returns `200 { "links": { ... } }` with refreshed `Set-Cookie` or `401 { "error": "Unauthorized", "oidcEnabled": <bool> }`.
 - `POST /?action=login` → Single-user mode only (returns `403` when OIDC is enabled): JSON `{ "secret": "..." }` → derives `HMAC-SHA256(secret, "golinks-session-v1")`, constant-time checks against `user.user_secret` in DB; sets HS256 JWT `golinks_auth` cookie (`HttpOnly; SameSite=Lax; Path=/; Max-Age=<session_ttl_secs>[; Secure]`) and returns `200 { "ok": true }` or `401`.
-- `POST /?action=saveLink` *(auth required)* → JSON `{ "originalKey"?: "...", "key": "...", "target": "..." }` → validates keyword (1–32 chars, no whitespace/`/`/`?`/`#`) and target (1–512 chars, `http://` or `https://`), atomically creates/updates/renames in `links` scoped by `user.user_id`, returns `200 { "links": { ... } }` with refreshed `Set-Cookie`.
+- `POST /?action=saveLink` *(auth required)* → JSON `{ "originalKey"?: "...", "key": "...", "target": "..." }` → validates keyword (1–32 chars, no whitespace/`?`/`#`, must not start with `/`; `/` allowed inside) and target (1–512 chars, `http://` or `https://`), atomically creates/updates/renames in `links` scoped by `user.user_id`, returns `200 { "links": { ... } }` with refreshed `Set-Cookie`.
 - `POST /?action=deleteLink` *(auth required)* → JSON `{ "key": "..." }` → deletes link for `user.user_id`, returns `200 { "links": { ... } }` with refreshed `Set-Cookie` or `404`.
 
 ### 3. React UI (`frontend/`)
 - Built with **Vite + React 18 + `react-router-dom` (`HashRouter`) + `vite-plugin-singlefile`** (inlines JS & CSS into one `dist/index.html`).
 - **401 handling:** When an API call returns `401` with `oidcEnabled: true`, the SPA navigates to `/` (`window.location.replace('/')`) to trigger the backend's direct OIDC redirect. When `oidcEnabled` is false, it renders `<LoginPage />` (supporting `?next=...`).
 - **Links list (`LinkList.jsx`, `/#/`):** Sorted list, live search/filter box, **New** button (`/#/edit`), click row to edit (`/#/edit/<keyword>`), and **Open ↗** action.
-  - If the link target contains `%s`, clicking **Open ↗** opens a modal dialog prompting for the parameter (**Go** / **Cancel**, `Escape` and backdrop dismiss) and opens `/<keyword>/<encoded-param>` in a new tab.
+  - If the link target contains `%s`, clicking **Open ↗** opens a modal dialog prompting for the parameter (**Go** / **Cancel**, `Escape` and backdrop dismiss) and opens `/<keyword>%20<encoded-param>` in a new tab.
   - Otherwise **Open ↗** opens `/<keyword>` directly in a new tab.
 - **Edit/Create view (`EditLink.jsx`, `/#/edit` and `/#/edit/:keyword`):** Keyword and Target inputs, **Save**, **Cancel**, and **Delete** (hidden when creating a new link or when `/#/edit/<keyword>` does not yet exist, with `<keyword>` pre-filled).
 

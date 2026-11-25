@@ -1,6 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
+function encodeLinkPath(key) {
+  return key.split('/').map(encodeURIComponent).join('/');
+}
+
 export default function LinkList({ links }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
@@ -40,9 +44,9 @@ export default function LinkList({ links }) {
   function handlePromptSubmit(e) {
     e.preventDefault();
     if (!promptLink) return;
-    const base = `/${encodeURIComponent(promptLink.key)}`;
+    const base = `/${encodeLinkPath(promptLink.key)}`;
     const url = paramValue
-      ? `${base}/${encodeURIComponent(paramValue)}`
+      ? `${base}%20${encodeURIComponent(paramValue)}`
       : base;
     window.open(url, '_blank', 'noopener,noreferrer');
     setPromptLink(null);
@@ -104,7 +108,7 @@ export default function LinkList({ links }) {
               </div>
               <a
                 className="link-open"
-                href={`/${encodeURIComponent(key)}`}
+                href={`/${encodeLinkPath(key)}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 onClick={(e) => handleOpenClick(e, key, target)}

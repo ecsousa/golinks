@@ -305,8 +305,11 @@ fn validate_link_key(key: &str) -> Result<(), &'static str> {
     if key.chars().count() > MAX_LINK_KEY_CHARS {
         return Err("Keyword must be at most 32 characters.");
     }
-    if key.chars().any(|c| c.is_whitespace() || c == '/' || c == '?' || c == '#') {
-        return Err("Keyword must not contain spaces, '/', '?', or '#'.");
+    if key.starts_with('/') {
+        return Err("Keyword must not start with '/'.");
+    }
+    if key.chars().any(|c| c.is_whitespace() || c == '?' || c == '#') {
+        return Err("Keyword must not contain spaces, '?', or '#'.");
     }
     Ok(())
 }
@@ -558,9 +561,9 @@ async fn handle_redirect(
     with_set_cookie(resp, refreshed_cookie)
 }
 
-/// Splits the request path on the first `/` or space separator (including `%20` / `%2F`).
+/// Splits the request path on the first space separator (`%20` or literal space).
 fn split_link_and_rest(trimmed: &str) -> (&str, &str) {
-    const SEPARATORS: [&str; 5] = ["/", "%20", " ", "%2F", "%2f"];
+    const SEPARATORS: [&str; 2] = ["%20", " "];
 
     let earliest = SEPARATORS
         .iter()
@@ -825,6 +828,14 @@ mod tests {
         )
         .await
         .unwrap();
+        db.save_link(
+            user.user_id,
+            None,
+            "key1/subitem",
+            "https://example.com/search?q=%s",
+        )
+        .await
+        .unwrap();
 
         let state = AppState {
             db,
@@ -974,13 +985,28 @@ mod tests {
 
         let cases = [
             (
-                "/google/use%20curl/wget",
+                "/google%20use%20curl/wget",
                 Some("https://www.google.com/search?q=use+curl%2Fwget"),
                 StatusCode::FOUND,
             ),
             (
-                "/google%20use%20curl/wget",
-                Some("https://www.google.com/search?q=use+curl%2Fwget"),
+                "/google/use%20curl/wget",
+                Some("/#/edit/google%2Fuse"),
+                StatusCode::FOUND,
+            ),
+            (
+                "/key1/subitem%20something%20else",
+                Some("https://example.com/search?q=something+else"),
+                StatusCode::FOUND,
+            ),
+            (
+                "/key1%2Fsubitem%20something%20else",
+                Some("https://example.com/search?q=something+else"),
+                StatusCode::FOUND,
+            ),
+            (
+                "/key1/subitem",
+                Some("https://example.com/search?q="),
                 StatusCode::FOUND,
             ),
             (
@@ -1000,7 +1026,7 @@ mod tests {
             ),
             (
                 "/google/",
-                Some("https://www.google.com/search?q="),
+                Some("/#/edit/google%2F"),
                 StatusCode::FOUND,
             ),
             (
@@ -1010,16 +1036,16 @@ mod tests {
             ),
             (
                 "/docs/",
-                Some("https://docs.example.com"),
+                Some("/#/edit/docs%2F"),
                 StatusCode::FOUND,
             ),
             (
                 "/docs/extra/segments",
-                Some("https://docs.example.com"),
+                Some("/#/edit/docs%2Fextra%2Fsegments"),
                 StatusCode::FOUND,
             ),
             (
-                "/m/1",
+                "/m%201",
                 Some("https://www.google.com/maps/preview?authuser=1"),
                 StatusCode::FOUND,
             ),
@@ -1257,6 +1283,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_target_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn validation_allows_slash_in_keyword_and_rejects_leading_slash_or_space() {
+        let (state, _dir) = test_state(false).await;
+        let cookie_hdr = make_jwt_cookie("golinks", "someSuperSecretValue");
+        let app = build_router(state);
+
+        let slash_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":"team/docs","target":"https://docs.example.com/%s"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slash_resp.status(), StatusCode::OK);
+
+        for invalid_key in ["/leading", "has space", "has?query", "has#frag"] {
+            let bad_resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/?action=saveLink")
+                        .header(header::COOKIE, &cookie_hdr)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_string(&json!({
+                                "key": invalid_key,
+                                "target": "https://example.com",
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                bad_resp.status(),
+                StatusCode::BAD_REQUEST,
+                "invalid_key={invalid_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_link_and_rest_splits_on_spaces_only() {
+        assert_eq!(
+            split_link_and_rest("key1/subitem something else"),
+            ("key1/subitem", "something else")
+        );
+        assert_eq!(
+            split_link_and_rest("key1/subitem%20something%20else"),
+            ("key1/subitem", "something%20else")
+        );
+        assert_eq!(
+            split_link_and_rest("key1/subitem"),
+            ("key1/subitem", "")
+        );
+        assert_eq!(
+            split_link_and_rest("key1%2Fsubitem%20a/b"),
+            ("key1%2Fsubitem", "a/b")
+        );
     }
 
     #[tokio::test]
