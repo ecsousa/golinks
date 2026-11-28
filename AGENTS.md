@@ -10,7 +10,7 @@ Instructions and conventions for AI agents working in this repository.
 
 - `Cargo.toml` / `Cargo.lock` — Rust binary crate (`edition = "2024"`, `sqlx` with `sqlite`, `postgres`, and `tls-rustls-ring-webpki`; `openidconnect` + `reqwest` with `rustls-tls` and no OpenSSL).
 - `build.rs` — Build script scanning `db/sqlite/` and `db/postgres/` (`full_schema.sql` + `migration_vXXXXXXX.sql` with matching versions across engines) and generating `$OUT_DIR/embedded_db.rs`.
-- `db/sqlite/` & `db/postgres/` — Full database schemas (`schema_migration`, `users`, `links`; `users.user_name VARCHAR(255)`) and incremental migrations (`migration_v0000002.sql`) embedded at compile time; PostgreSQL tables live in the `golinks` schema.
+- `db/sqlite/` & `db/postgres/` — Full database schemas (`schema_migration`, `users`, `links`, `tags`, `link_tags`; `users.user_name VARCHAR(255)`) and incremental migrations (`migration_v0000002.sql`, `migration_v0000003.sql`) embedded at compile time; PostgreSQL tables live in the `golinks` schema.
 - `src/main.rs` — Axum router, `/` UI & `?action=...` JSON APIs, OIDC redirect/callback handling on `/`, sliding-window JWT authentication, redirect/URL-encoding logic, `/favicon.ico` handler, security-header middleware, and integration tests.
 - `src/db/mod.rs` — `Database` connection pool wrapper (`SqlitePool` / `PgPool`), `sync_user`, `get_or_create_user`, user lookup, and `user_id`-scoped link CRUD queries.
 - `src/db/config.rs` — Environment variable parsing (`AppConfig`, `AuthConfig`, `OidcConfig`, `DbConfig`, `DbEngine`).
@@ -46,7 +46,7 @@ Do **not** break these invariants without explicit user approval:
    - `GOLINKS_DB_ENGINE` selects `sqlite` (default; uses `GOLINKS_DB_PATH`, defaulting to `./golinks.db` locally and `/data/golinks.db` in Docker) or `postgresql` (requires `GOLINKS_DB_HOST`, `GOLINKS_DB_NAME`, `GOLINKS_DB_USERNAME`, `GOLINKS_DB_PASSWORD`; `GOLINKS_DB_PORT` defaults to `5432`).
    - Keep all database DDL and incremental migrations in `db/sqlite/` and `db/postgres/` (`full_schema.sql` plus matching `migration_vXXXXXXX.sql` files across both engines); `build.rs` embeds them at compile time and fails the build on version mismatch.
    - PostgreSQL objects reside in the `golinks` schema (connections set `search_path=golinks`), while SQLite uses the default `main` schema.
-   - All link queries and mutations (`list_links`, `get_link_target`, `save_link`, `delete_link`) must remain scoped by `user_id` to preserve multi-user data isolation.
+   - All link and tag queries and mutations (`list_links`, `get_link_target`, `save_link`, `delete_link`) must remain scoped by `user_id` to preserve multi-user data isolation; unused tags are automatically pruned for `user_id` inside `save_link` and `delete_link` transactions.
 4. **Privacy (Public Repo):**
    - Never commit personal domains, personal self-hosted service names, or real secrets in code, tests, docs, or commit messages. Always use generic placeholders (`example.com`, `docs`, `notes`, `google`, `someSuperSecretValue`, etc.).
 

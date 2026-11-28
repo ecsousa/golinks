@@ -302,10 +302,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<String, _>("version").trim(), "v0000002");
+        assert_eq!(rows[0].get::<String, _>("version").trim(), "v0000003");
         assert!(rows[0].get::<bool, _>("success"));
 
-        for table in ["users", "links"] {
+        for table in ["users", "links", "tags", "link_tags"] {
             let count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
             )
@@ -401,20 +401,20 @@ mod tests {
             full_schema: base.full_schema,
             migrations: &[
                 (
-                    "v0000003",
+                    "v0000004",
                     "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, note TEXT NOT NULL);",
                 ),
                 (
-                    "v0000004",
+                    "v0000005",
                     "ALTER TABLE audit_log ADD COLUMN created_by TEXT NOT NULL DEFAULT 'system';",
                 ),
             ],
-            latest_version: "v0000004",
+            latest_version: "v0000005",
         };
 
         run_sqlite_migrations(pool, &synthetic_spec).await.unwrap();
 
-        // Verify v0000003 ran before v0000004 by using both the table and the added column.
+        // Verify v0000004 ran before v0000005 by using both the table and the added column.
         sqlx::query("INSERT INTO audit_log (note, created_by) VALUES (?, ?)")
             .bind("migrated")
             .bind("tester")
@@ -430,7 +430,7 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 3);
 
-        let expected = ["v0000002", "v0000003", "v0000004"];
+        let expected = ["v0000003", "v0000004", "v0000005"];
         for (row, exp_ver) in rows.iter().zip(expected.iter()) {
             assert_eq!(row.get::<String, _>("version").trim(), *exp_ver);
             assert!(row.get::<i64, _>("execution_time_ms") >= 0);
@@ -454,22 +454,22 @@ mod tests {
             full_schema: base.full_schema,
             migrations: &[
                 (
-                    "v0000003",
+                    "v0000004",
                     "CREATE TABLE should_rollback (id INTEGER PRIMARY KEY); THIS IS INVALID SQL;",
                 ),
                 (
-                    "v0000004",
+                    "v0000005",
                     "CREATE TABLE should_not_run (id INTEGER PRIMARY KEY);",
                 ),
             ],
-            latest_version: "v0000004",
+            latest_version: "v0000005",
         };
 
         let err = run_sqlite_migrations(pool, &failing_spec)
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("v0000003"),
+            err.to_string().contains("v0000004"),
             "unexpected error: {err}"
         );
 
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(rolled_back_table, 0);
 
         let failed_row =
-            sqlx::query("SELECT success FROM schema_migration WHERE version = 'v0000003'")
+            sqlx::query("SELECT success FROM schema_migration WHERE version = 'v0000004'")
                 .fetch_one(pool)
                 .await
                 .unwrap();
@@ -493,20 +493,20 @@ mod tests {
             full_schema: base.full_schema,
             migrations: &[
                 (
-                    "v0000003",
+                    "v0000004",
                     "CREATE TABLE should_rollback (id INTEGER PRIMARY KEY);",
                 ),
                 (
-                    "v0000004",
+                    "v0000005",
                     "CREATE TABLE should_not_run (id INTEGER PRIMARY KEY);",
                 ),
             ],
-            latest_version: "v0000004",
+            latest_version: "v0000005",
         };
 
         let err2 = run_sqlite_migrations(pool, &fixed_spec).await.unwrap_err();
         assert!(
-            err2.to_string().contains("v0000003"),
+            err2.to_string().contains("v0000004"),
             "unexpected error: {err2}"
         );
 
@@ -548,10 +548,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upgrades_v0000002_sqlite_database_to_v0000003_preserving_links() {
+        let db = Database::connect(&DbConfig::Sqlite {
+            path: ":memory:".to_string(),
+        })
+        .await
+        .unwrap();
+        let pool = db.sqlite_pool();
+
+        sqlx::raw_sql(
+            "CREATE TABLE schema_migration (
+                version CHAR(8) PRIMARY KEY,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                execution_time_ms INTEGER,
+                success BOOLEAN NOT NULL DEFAULT 1
+            );
+            CREATE TABLE users (
+                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name VARCHAR(255) NOT NULL UNIQUE,
+                user_secret VARCHAR(64) NOT NULL,
+                created_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE links (
+                link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                link_keyword VARCHAR(32) NOT NULL,
+                link_target VARCHAR(512) NOT NULL,
+                created_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_links_user_keyword UNIQUE (user_id, link_keyword)
+            );
+            INSERT INTO schema_migration (version, execution_time_ms, success) VALUES ('v0000002', 0, 1);
+            INSERT INTO users (user_name, user_secret) VALUES ('alice', 'secret');
+            INSERT INTO links (user_id, link_keyword, link_target) VALUES (1, 'docs', 'https://docs.example.com');",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        db.run_migrations().await.unwrap();
+
+        let versions: Vec<String> =
+            sqlx::query_scalar("SELECT version FROM schema_migration ORDER BY version")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        assert_eq!(versions, vec!["v0000002", "v0000003"]);
+
+        let existing_target: String =
+            sqlx::query_scalar("SELECT link_target FROM links WHERE link_keyword = 'docs'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(existing_target, "https://docs.example.com");
+
+        sqlx::query("INSERT INTO tags (user_id, tag_name) VALUES (1, 'work')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO link_tags (link_id, tag_id) VALUES (1, 1)")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn embedded_postgres_schema_contains_golinks_schema_and_tables() {
         let spec = embedded_postgres_spec();
-        assert_eq!(spec.latest_version, "v0000002");
+        assert_eq!(spec.latest_version, "v0000003");
         assert!(spec
             .full_schema
             .contains("CREATE SCHEMA IF NOT EXISTS golinks"));
@@ -559,5 +625,7 @@ mod tests {
         assert!(spec.full_schema.contains("golinks.users"));
         assert!(spec.full_schema.contains("user_name VARCHAR(255)"));
         assert!(spec.full_schema.contains("golinks.links"));
+        assert!(spec.full_schema.contains("golinks.tags"));
+        assert!(spec.full_schema.contains("golinks.link_tags"));
     }
 }
