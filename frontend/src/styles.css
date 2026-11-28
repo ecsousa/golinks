@@ -352,3 +352,68 @@ body {
   gap: 0.6rem;
   margin-top: 1.25rem;
 }
+
+.tag-input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+}
+
+.tag-input-box {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: text;
+}
+
+.tag-input-box:focus-within {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.tag-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tag-chip-remove:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+.tag-input-field {
+  flex: 1;
+  min-width: 110px;
+  width: auto !important;
+  padding: 0.2rem 0.15rem !important;
+  border: none !important;
+  background: transparent !important;
+  outline: none !important;
+}
