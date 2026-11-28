@@ -341,10 +341,11 @@ fn normalize_and_validate_tags(raw_tags: &[String]) -> Result<Vec<String>, &'sta
         if trimmed.chars().any(char::is_whitespace) {
             return Err("Tags must not contain whitespace.");
         }
-        if trimmed.chars().count() > MAX_TAG_CHARS {
+        let lower = trimmed.to_lowercase();
+        if lower.chars().count() > MAX_TAG_CHARS {
             return Err("Each tag must be at most 32 characters.");
         }
-        normalized.insert(trimmed.to_lowercase());
+        normalized.insert(lower);
     }
     Ok(normalized.into_iter().collect())
 }
@@ -2174,5 +2175,14 @@ mod tests {
             bob_body["links"]["docs"]["tags"],
             json!(["bob-only", "work"])
         );
+    }
+
+    #[test]
+    fn normalize_and_validate_tags_checks_length_after_lowercasing() {
+        // U+0130 ('İ') expands to 2 Unicode scalar values ("i\u{307}") on to_lowercase().
+        let expanding = "\u{0130}".repeat(20);
+        assert_eq!(expanding.chars().count(), 20);
+        assert_eq!(expanding.to_lowercase().chars().count(), 40);
+        assert!(normalize_and_validate_tags(&[expanding]).is_err());
     }
 }

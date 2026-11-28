@@ -214,6 +214,7 @@ export default function EditLink({ links, onDataUpdated, onUnauthorized }) {
               <button
                 type="button"
                 className="btn btn-secondary"
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={handleAddTagClick}
                 disabled={busy || !tagInput.trim()}
               >
@@ -227,7 +228,12 @@ export default function EditLink({ links, onDataUpdated, onUnauthorized }) {
 
           <div className="actions">
             <div className="actions-left">
-              <button type="submit" className="btn btn-primary" disabled={busy}>
+              <button
+                type="submit"
+                className="btn btn-primary"
+                onMouseDown={(e) => e.preventDefault()}
+                disabled={busy}
+              >
                 {busy ? 'Saving…' : 'Save'}
               </button>
               <button
