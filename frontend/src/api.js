@@ -27,7 +27,10 @@ export async function getLinks() {
   if (!resp.ok) {
     throw new Error(data.error || `Failed to load links (${resp.status})`);
   }
-  return data.links || {};
+  return {
+    links: data.links || {},
+    tags: Array.isArray(data.tags) ? data.tags : [],
+  };
 }
 
 export async function login(secret) {
@@ -44,12 +47,12 @@ export async function login(secret) {
   return data;
 }
 
-export async function saveLink({ originalKey, key, target }) {
+export async function saveLink({ originalKey, key, target, tags = [] }) {
   const resp = await fetch('/?action=saveLink', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ originalKey, key, target }),
+    body: JSON.stringify({ originalKey, key, target, tags }),
   });
   const data = await parseJsonSafe(resp);
   if (resp.status === 401) {
@@ -58,7 +61,10 @@ export async function saveLink({ originalKey, key, target }) {
   if (!resp.ok) {
     throw new Error(data.error || `Failed to save link (${resp.status})`);
   }
-  return data.links || {};
+  return {
+    links: data.links || {},
+    tags: Array.isArray(data.tags) ? data.tags : [],
+  };
 }
 
 export async function deleteLink(key) {
@@ -75,5 +81,8 @@ export async function deleteLink(key) {
   if (!resp.ok) {
     throw new Error(data.error || `Failed to delete link (${resp.status})`);
   }
-  return data.links || {};
+  return {
+    links: data.links || {},
+    tags: Array.isArray(data.tags) ? data.tags : [],
+  };
 }

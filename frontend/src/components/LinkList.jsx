@@ -5,21 +5,41 @@ function encodeLinkPath(key) {
   return key.split('/').map(encodeURIComponent).join('/');
 }
 
-export default function LinkList({ links }) {
+export default function LinkList({ links, tags = [] }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
+  const [selectedTags, setSelectedTags] = useState([]);
   const [promptLink, setPromptLink] = useState(null); // { key, target } | null
   const [paramValue, setParamValue] = useState('');
+
+  useEffect(() => {
+    setSelectedTags((prev) => {
+      const next = prev.filter((tag) => tags.includes(tag));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [tags]);
+
+  function toggleTag(tag) {
+    setSelectedTags((prev) =>
+      prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
+    );
+  }
 
   const entries = useMemo(() => {
     const sorted = Object.entries(links).sort(([a], [b]) => a.localeCompare(b));
     const q = query.trim().toLowerCase();
-    if (!q) return sorted;
-    return sorted.filter(
-      ([key, target]) =>
-        key.toLowerCase().includes(q) || target.toLowerCase().includes(q)
-    );
-  }, [links, query]);
+    return sorted.filter(([key, entry]) => {
+      const target = entry?.target || '';
+      const linkTags = Array.isArray(entry?.tags) ? entry.tags : [];
+      if (q && !key.toLowerCase().includes(q) && !target.toLowerCase().includes(q)) {
+        return false;
+      }
+      if (selectedTags.length > 0 && !linkTags.some((t) => selectedTags.includes(t))) {
+        return false;
+      }
+      return true;
+    });
+  }, [links, query, selectedTags]);
 
   useEffect(() => {
     if (!promptLink) return;
@@ -78,46 +98,83 @@ export default function LinkList({ links }) {
         />
       </div>
 
+      {tags.length > 0 && (
+        <div className="tag-filter-bar" role="group" aria-label="Filter by tags">
+          {tags.map((tag) => {
+            const active = selectedTags.includes(tag);
+            return (
+              <button
+                key={tag}
+                type="button"
+                className={active ? 'tag-pill active' : 'tag-pill'}
+                aria-pressed={active}
+                onClick={() => toggleTag(tag)}
+              >
+                {tag}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {entries.length === 0 ? (
         <div className="empty-state card">
           {Object.keys(links).length === 0 ? (
             <p className="muted">No links yet. Click &ldquo;New&rdquo; to create your first link.</p>
           ) : (
-            <p className="muted">No links match &ldquo;{query}&rdquo;.</p>
+            <p className="muted">
+              No links match the current filter
+              {query.trim() ? ` (“${query.trim()}”)` : ''}.
+            </p>
           )}
         </div>
       ) : (
         <ul className="link-list">
-          {entries.map(([key, target]) => (
-            <li
-              key={key}
-              className="link-item"
-              onClick={() => navigate(`/edit/${encodeURIComponent(key)}`)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  navigate(`/edit/${encodeURIComponent(key)}`);
-                }
-              }}
-              role="button"
-              tabIndex={0}
-            >
-              <div className="link-main">
-                <span className="link-key">{key}</span>
-                <span className="link-target">{target}</span>
-              </div>
-              <a
-                className="link-open"
-                href={`/${encodeLinkPath(key)}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={(e) => handleOpenClick(e, key, target)}
-                title={`Open /${key}`}
+          {entries.map(([key, entry]) => {
+            const target = entry?.target || '';
+            const linkTags = Array.isArray(entry?.tags) ? entry.tags : [];
+            return (
+              <li
+                key={key}
+                className="link-item"
+                onClick={() => navigate(`/edit/${encodeURIComponent(key)}`)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    navigate(`/edit/${encodeURIComponent(key)}`);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
               >
-                Open ↗
-              </a>
-            </li>
-          ))}
+                <div className="link-main">
+                  <div className="link-key-row">
+                    <span className="link-key">{key}</span>
+                    {linkTags.length > 0 && (
+                      <span className="link-tags">
+                        {linkTags.map((tag) => (
+                          <span key={tag} className="tag-badge">
+                            {tag}
+                          </span>
+                        ))}
+                      </span>
+                    )}
+                  </div>
+                  <span className="link-target">{target}</span>
+                </div>
+                <a
+                  className="link-open"
+                  href={`/${encodeLinkPath(key)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => handleOpenClick(e, key, target)}
+                  title={`Open /${key}`}
+                >
+                  Open ↗
+                </a>
+              </li>
+            );
+          })}
         </ul>
       )}
 

@@ -90,7 +90,39 @@ body {
 }
 
 .search-bar {
+  margin-bottom: 0.75rem;
+}
+
+.tag-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
   margin-bottom: 1rem;
+}
+
+.tag-pill {
+  padding: 0.25rem 0.65rem;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.tag-pill:hover {
+  background: var(--hover);
+}
+
+.tag-pill.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.tag-pill.active:hover {
+  background: var(--primary-hover);
 }
 
 .search-bar input,
@@ -231,9 +263,33 @@ body {
   gap: 0.15rem;
 }
 
+.link-key-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
 .link-key {
   font-weight: 600;
   font-size: 0.98rem;
+}
+
+.link-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.tag-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
 }
 
 .link-target {

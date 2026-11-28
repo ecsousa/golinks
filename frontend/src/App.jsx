@@ -25,12 +25,18 @@ function getSafeNextPath() {
 export default function App() {
   const [status, setStatus] = useState('loading'); // 'loading' | 'unauthenticated' | 'authenticated' | 'error'
   const [links, setLinks] = useState({});
+  const [tags, setTags] = useState([]);
   const [loadError, setLoadError] = useState('');
+
+  const handleDataUpdated = useCallback((data) => {
+    setLinks(data.links || {});
+    setTags(Array.isArray(data.tags) ? data.tags : []);
+  }, []);
 
   const refreshLinks = useCallback(async () => {
     try {
       const data = await getLinks();
-      setLinks(data);
+      handleDataUpdated(data);
       setLoadError('');
       setStatus('authenticated');
     } catch (err) {
@@ -45,7 +51,7 @@ export default function App() {
         setStatus('error');
       }
     }
-  }, []);
+  }, [handleDataUpdated]);
 
   useEffect(() => {
     refreshLinks();
@@ -98,13 +104,13 @@ export default function App() {
   return (
     <HashRouter>
       <Routes>
-        <Route path="/" element={<LinkList links={links} />} />
+        <Route path="/" element={<LinkList links={links} tags={tags} />} />
         <Route
           path="/edit"
           element={
             <EditLink
               links={links}
-              onLinksUpdated={setLinks}
+              onDataUpdated={handleDataUpdated}
               onUnauthorized={handleUnauthorized}
             />
           }
@@ -114,7 +120,7 @@ export default function App() {
           element={
             <EditLink
               links={links}
-              onLinksUpdated={setLinks}
+              onDataUpdated={handleDataUpdated}
               onUnauthorized={handleUnauthorized}
             />
           }
