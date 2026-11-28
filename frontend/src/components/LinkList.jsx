@@ -9,8 +9,25 @@ export default function LinkList({ links, tags = [] }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [selectedTags, setSelectedTags] = useState([]);
+  const [uncategorizedSelected, setUncategorizedSelected] = useState(false);
   const [promptLink, setPromptLink] = useState(null); // { key, target } | null
   const [paramValue, setParamValue] = useState('');
+
+  const showUncategorized = useMemo(() => {
+    let hasTagged = false;
+    let hasUntagged = false;
+    for (const entry of Object.values(links)) {
+      if (Array.isArray(entry?.tags) && entry.tags.length > 0) {
+        hasTagged = true;
+      } else {
+        hasUntagged = true;
+      }
+      if (hasTagged && hasUntagged) {
+        return true;
+      }
+    }
+    return false;
+  }, [links]);
 
   useEffect(() => {
     setSelectedTags((prev) => {
@@ -18,6 +35,12 @@ export default function LinkList({ links, tags = [] }) {
       return next.length === prev.length ? prev : next;
     });
   }, [tags]);
+
+  useEffect(() => {
+    if (!showUncategorized && uncategorizedSelected) {
+      setUncategorizedSelected(false);
+    }
+  }, [showUncategorized, uncategorizedSelected]);
 
   function toggleTag(tag) {
     setSelectedTags((prev) =>
@@ -28,18 +51,23 @@ export default function LinkList({ links, tags = [] }) {
   const entries = useMemo(() => {
     const sorted = Object.entries(links).sort(([a], [b]) => a.localeCompare(b));
     const q = query.trim().toLowerCase();
+    const hasTagFilter = selectedTags.length > 0 || uncategorizedSelected;
     return sorted.filter(([key, entry]) => {
       const target = entry?.target || '';
       const linkTags = Array.isArray(entry?.tags) ? entry.tags : [];
       if (q && !key.toLowerCase().includes(q) && !target.toLowerCase().includes(q)) {
         return false;
       }
-      if (selectedTags.length > 0 && !linkTags.some((t) => selectedTags.includes(t))) {
-        return false;
+      if (hasTagFilter) {
+        const matchesTag = linkTags.some((t) => selectedTags.includes(t));
+        const matchesUncategorized = uncategorizedSelected && linkTags.length === 0;
+        if (!matchesTag && !matchesUncategorized) {
+          return false;
+        }
       }
       return true;
     });
-  }, [links, query, selectedTags]);
+  }, [links, query, selectedTags, uncategorizedSelected]);
 
   useEffect(() => {
     if (!promptLink) return;
@@ -98,7 +126,7 @@ export default function LinkList({ links, tags = [] }) {
         />
       </div>
 
-      {tags.length > 0 && (
+      {(tags.length > 0 || showUncategorized) && (
         <div className="tag-filter-bar" role="group" aria-label="Filter by tags">
           {tags.map((tag) => {
             const active = selectedTags.includes(tag);
@@ -114,6 +142,20 @@ export default function LinkList({ links, tags = [] }) {
               </button>
             );
           })}
+          {showUncategorized && (
+            <button
+              type="button"
+              className={
+                uncategorizedSelected
+                  ? 'tag-pill tag-pill-pseudo active'
+                  : 'tag-pill tag-pill-pseudo'
+              }
+              aria-pressed={uncategorizedSelected}
+              onClick={() => setUncategorizedSelected((prev) => !prev)}
+            >
+              uncategorized
+            </button>
+          )}
         </div>
       )}
 

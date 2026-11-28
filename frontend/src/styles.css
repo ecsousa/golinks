@@ -125,6 +125,10 @@ body {
   background: var(--primary-hover);
 }
 
+.tag-pill-pseudo {
+  border-style: dashed;
+}
+
 .search-bar input,
 .field input {
   width: 100%;
