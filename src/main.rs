@@ -444,7 +444,7 @@ async fn handle_root_post(
 
             match state
                 .db
-                .save_link(user.user_id, req.original_key.as_deref(), &key, &target)
+                .save_link(user.user_id, req.original_key.as_deref(), &key, &target, &[])
                 .await
             {
                 Ok(links) => {
@@ -814,10 +814,11 @@ mod tests {
             None,
             "google",
             "https://www.google.com/search?q=%s",
+            &[],
         )
         .await
         .unwrap();
-        db.save_link(user.user_id, None, "docs", "https://docs.example.com")
+        db.save_link(user.user_id, None, "docs", "https://docs.example.com", &[])
             .await
             .unwrap();
         db.save_link(
@@ -825,6 +826,7 @@ mod tests {
             None,
             "m",
             "https://www.google.com/maps/preview?authuser=%s",
+            &[],
         )
         .await
         .unwrap();
@@ -833,6 +835,7 @@ mod tests {
             None,
             "key1/subitem",
             "https://example.com/search?q=%s",
+            &[],
         )
         .await
         .unwrap();
@@ -1194,16 +1197,16 @@ mod tests {
         })
         .await
         .unwrap();
-        let links = reopened.list_links(user_id).await.unwrap();
-        assert!(!links.contains_key("gh"));
-        assert!(!links.contains_key("github"));
-        assert!(!links.contains_key("m"));
+        let payload = reopened.list_links(user_id).await.unwrap();
+        assert!(!payload.links.contains_key("gh"));
+        assert!(!payload.links.contains_key("github"));
+        assert!(!payload.links.contains_key("m"));
         assert_eq!(
-            links.get("docs").map(String::as_str),
+            payload.links.get("docs").map(|e| e.target.as_str()),
             Some("https://new-docs.example.com")
         );
         assert_eq!(
-            links.get("google").map(String::as_str),
+            payload.links.get("google").map(|e| e.target.as_str()),
             Some("https://www.google.com/search?q=%s")
         );
     }

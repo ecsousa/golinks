@@ -1,10 +1,11 @@
 pub mod config;
 pub mod migrations;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
+use serde::Serialize;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{PgPool, SqlitePool};
@@ -52,6 +53,20 @@ pub struct User {
     #[cfg_attr(not(test), allow(dead_code))]
     pub user_name: String,
     pub user_secret: String,
+}
+
+/// Link entry with its target URL and sorted tags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkEntry {
+    pub target: String,
+    pub tags: Vec<String>,
+}
+
+/// Complete per-user links map and sorted list of all tags belonging to the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinksPayload {
+    pub links: BTreeMap<String, LinkEntry>,
+    pub tags: Vec<String>,
 }
 
 fn user_from_row((user_id, user_name, user_secret): (i32, String, String)) -> User {
@@ -346,29 +361,86 @@ impl Database {
         Ok(row.map(user_from_row))
     }
 
-    /// Lists all links belonging to `user_id`, ordered by keyword.
-    pub async fn list_links(&self, user_id: i32) -> Result<BTreeMap<String, String>, DbError> {
-        let rows = match &self.backend {
+    /// Lists all links and tags belonging to `user_id`, ordered alphabetically.
+    pub async fn list_links(&self, user_id: i32) -> Result<LinksPayload, DbError> {
+        let (link_rows, link_tag_rows, all_tags) = match &self.backend {
             Backend::Sqlite(pool) => {
-                sqlx::query_as::<_, (String, String)>(
-                    "SELECT link_keyword, link_target FROM links \
+                let link_rows = sqlx::query_as::<_, (i32, String, String)>(
+                    "SELECT link_id, link_keyword, link_target FROM links \
                      WHERE user_id = ? ORDER BY link_keyword ASC",
                 )
                 .bind(user_id)
                 .fetch_all(pool)
-                .await?
+                .await?;
+
+                let link_tag_rows = sqlx::query_as::<_, (i32, String)>(
+                    "SELECT lt.link_id, t.tag_name \
+                     FROM link_tags lt \
+                     INNER JOIN tags t ON t.tag_id = lt.tag_id \
+                     WHERE t.user_id = ? \
+                     ORDER BY t.tag_name ASC",
+                )
+                .bind(user_id)
+                .fetch_all(pool)
+                .await?;
+
+                let all_tags = sqlx::query_scalar::<_, String>(
+                    "SELECT tag_name FROM tags WHERE user_id = ? ORDER BY tag_name ASC",
+                )
+                .bind(user_id)
+                .fetch_all(pool)
+                .await?;
+
+                (link_rows, link_tag_rows, all_tags)
             }
             Backend::Postgres(pool) => {
-                sqlx::query_as::<_, (String, String)>(
-                    "SELECT link_keyword, link_target FROM links \
+                let link_rows = sqlx::query_as::<_, (i32, String, String)>(
+                    "SELECT link_id, link_keyword, link_target FROM links \
                      WHERE user_id = $1 ORDER BY link_keyword ASC",
                 )
                 .bind(user_id)
                 .fetch_all(pool)
-                .await?
+                .await?;
+
+                let link_tag_rows = sqlx::query_as::<_, (i32, String)>(
+                    "SELECT lt.link_id, t.tag_name \
+                     FROM link_tags lt \
+                     INNER JOIN tags t ON t.tag_id = lt.tag_id \
+                     WHERE t.user_id = $1 \
+                     ORDER BY t.tag_name ASC",
+                )
+                .bind(user_id)
+                .fetch_all(pool)
+                .await?;
+
+                let all_tags = sqlx::query_scalar::<_, String>(
+                    "SELECT tag_name FROM tags WHERE user_id = $1 ORDER BY tag_name ASC",
+                )
+                .bind(user_id)
+                .fetch_all(pool)
+                .await?;
+
+                (link_rows, link_tag_rows, all_tags)
             }
         };
-        Ok(rows.into_iter().collect())
+
+        let mut tags_by_link_id: HashMap<i32, Vec<String>> = HashMap::new();
+        for (link_id, tag_name) in link_tag_rows {
+            tags_by_link_id.entry(link_id).or_default().push(tag_name);
+        }
+
+        let links = link_rows
+            .into_iter()
+            .map(|(link_id, keyword, target)| {
+                let tags = tags_by_link_id.remove(&link_id).unwrap_or_default();
+                (keyword, LinkEntry { target, tags })
+            })
+            .collect();
+
+        Ok(LinksPayload {
+            links,
+            tags: all_tags,
+        })
     }
 
     /// Looks up a single link target for `user_id` and `keyword`.
@@ -400,14 +472,16 @@ impl Database {
         Ok(target)
     }
 
-    /// Atomically creates, updates, or renames a link for `user_id`, returning the updated map.
+    /// Atomically creates, updates, or renames a link and replaces its tags for `user_id`,
+    /// auto-deleting any tags no longer referenced by any link of `user_id`.
     pub async fn save_link(
         &self,
         user_id: i32,
         original_key: Option<&str>,
         key: &str,
         target: &str,
-    ) -> Result<BTreeMap<String, String>, DbError> {
+        tags: &[String],
+    ) -> Result<LinksPayload, DbError> {
         let rename_from = original_key
             .map(str::trim)
             .filter(|orig| !orig.is_empty() && *orig != key);
@@ -422,16 +496,60 @@ impl Database {
                         .execute(&mut *tx)
                         .await?;
                 }
-                sqlx::query(
+                let link_id: i32 = sqlx::query_scalar(
                     "INSERT INTO links (user_id, link_keyword, link_target) VALUES (?, ?, ?) \
                      ON CONFLICT (user_id, link_keyword) \
-                     DO UPDATE SET link_target = EXCLUDED.link_target, updated_on = CURRENT_TIMESTAMP",
+                     DO UPDATE SET link_target = EXCLUDED.link_target, updated_on = CURRENT_TIMESTAMP \
+                     RETURNING link_id",
                 )
                 .bind(user_id)
                 .bind(key)
                 .bind(target)
+                .fetch_one(&mut *tx)
+                .await?;
+
+                sqlx::query("DELETE FROM link_tags WHERE link_id = ?")
+                    .bind(link_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                for tag_name in tags {
+                    sqlx::query(
+                        "INSERT INTO tags (user_id, tag_name) VALUES (?, ?) \
+                         ON CONFLICT (user_id, tag_name) DO NOTHING",
+                    )
+                    .bind(user_id)
+                    .bind(tag_name)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    let tag_id: i32 = sqlx::query_scalar(
+                        "SELECT tag_id FROM tags WHERE user_id = ? AND tag_name = ?",
+                    )
+                    .bind(user_id)
+                    .bind(tag_name)
+                    .fetch_one(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "INSERT INTO link_tags (link_id, tag_id) VALUES (?, ?) \
+                         ON CONFLICT (link_id, tag_id) DO NOTHING",
+                    )
+                    .bind(link_id)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                sqlx::query(
+                    "DELETE FROM tags \
+                     WHERE user_id = ? \
+                       AND NOT EXISTS (SELECT 1 FROM link_tags WHERE link_tags.tag_id = tags.tag_id)",
+                )
+                .bind(user_id)
                 .execute(&mut *tx)
                 .await?;
+
                 tx.commit().await?;
             }
             Backend::Postgres(pool) => {
@@ -443,16 +561,60 @@ impl Database {
                         .execute(&mut *tx)
                         .await?;
                 }
-                sqlx::query(
+                let link_id: i32 = sqlx::query_scalar(
                     "INSERT INTO links (user_id, link_keyword, link_target) VALUES ($1, $2, $3) \
                      ON CONFLICT (user_id, link_keyword) \
-                     DO UPDATE SET link_target = EXCLUDED.link_target, updated_on = CURRENT_TIMESTAMP",
+                     DO UPDATE SET link_target = EXCLUDED.link_target, updated_on = CURRENT_TIMESTAMP \
+                     RETURNING link_id",
                 )
                 .bind(user_id)
                 .bind(key)
                 .bind(target)
+                .fetch_one(&mut *tx)
+                .await?;
+
+                sqlx::query("DELETE FROM link_tags WHERE link_id = $1")
+                    .bind(link_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                for tag_name in tags {
+                    sqlx::query(
+                        "INSERT INTO tags (user_id, tag_name) VALUES ($1, $2) \
+                         ON CONFLICT (user_id, tag_name) DO NOTHING",
+                    )
+                    .bind(user_id)
+                    .bind(tag_name)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    let tag_id: i32 = sqlx::query_scalar(
+                        "SELECT tag_id FROM tags WHERE user_id = $1 AND tag_name = $2",
+                    )
+                    .bind(user_id)
+                    .bind(tag_name)
+                    .fetch_one(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "INSERT INTO link_tags (link_id, tag_id) VALUES ($1, $2) \
+                         ON CONFLICT (link_id, tag_id) DO NOTHING",
+                    )
+                    .bind(link_id)
+                    .bind(tag_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                sqlx::query(
+                    "DELETE FROM tags \
+                     WHERE user_id = $1 \
+                       AND NOT EXISTS (SELECT 1 FROM link_tags WHERE link_tags.tag_id = tags.tag_id)",
+                )
+                .bind(user_id)
                 .execute(&mut *tx)
                 .await?;
+
                 tx.commit().await?;
             }
         }
@@ -460,28 +622,57 @@ impl Database {
         self.list_links(user_id).await
     }
 
-    /// Deletes a link for `user_id` by `keyword`, returning `None` if no row was deleted.
+    /// Deletes a link for `user_id` by `keyword` and prunes any newly unused tags for `user_id`,
+    /// returning `None` if no row was deleted.
     pub async fn delete_link(
         &self,
         user_id: i32,
         keyword: &str,
-    ) -> Result<Option<BTreeMap<String, String>>, DbError> {
+    ) -> Result<Option<LinksPayload>, DbError> {
         let rows_affected = match &self.backend {
             Backend::Sqlite(pool) => {
-                sqlx::query("DELETE FROM links WHERE user_id = ? AND link_keyword = ?")
+                let mut tx = pool.begin().await?;
+                let affected =
+                    sqlx::query("DELETE FROM links WHERE user_id = ? AND link_keyword = ?")
+                        .bind(user_id)
+                        .bind(keyword)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                if affected > 0 {
+                    sqlx::query(
+                        "DELETE FROM tags \
+                         WHERE user_id = ? \
+                           AND NOT EXISTS (SELECT 1 FROM link_tags WHERE link_tags.tag_id = tags.tag_id)",
+                    )
                     .bind(user_id)
-                    .bind(keyword)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await?;
+                affected
             }
             Backend::Postgres(pool) => {
-                sqlx::query("DELETE FROM links WHERE user_id = $1 AND link_keyword = $2")
+                let mut tx = pool.begin().await?;
+                let affected =
+                    sqlx::query("DELETE FROM links WHERE user_id = $1 AND link_keyword = $2")
+                        .bind(user_id)
+                        .bind(keyword)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                if affected > 0 {
+                    sqlx::query(
+                        "DELETE FROM tags \
+                         WHERE user_id = $1 \
+                           AND NOT EXISTS (SELECT 1 FROM link_tags WHERE link_tags.tag_id = tags.tag_id)",
+                    )
                     .bind(user_id)
-                    .bind(keyword)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await?;
+                affected
             }
         };
 
@@ -687,37 +878,61 @@ mod tests {
         let user = db.sync_user("golinks", &secret).await.expect("sync user");
         let uid = user.user_id;
 
-        let links = db
-            .save_link(uid, None, "docs", "https://docs.example.com")
+        let payload = db
+            .save_link(uid, None, "docs", "https://docs.example.com", &[])
             .await
             .expect("insert docs");
         assert_eq!(
-            links,
-            BTreeMap::from([("docs".to_string(), "https://docs.example.com".to_string())])
+            payload,
+            LinksPayload {
+                links: BTreeMap::from([(
+                    "docs".to_string(),
+                    LinkEntry {
+                        target: "https://docs.example.com".to_string(),
+                        tags: vec![],
+                    },
+                )]),
+                tags: vec![],
+            }
         );
 
-        let links = db
-            .save_link(uid, None, "gh", "https://github.com/%s")
+        let payload = db
+            .save_link(uid, None, "gh", "https://github.com/%s", &[])
             .await
             .expect("insert gh");
         assert_eq!(
-            links,
+            payload.links,
             BTreeMap::from([
-                ("docs".to_string(), "https://docs.example.com".to_string()),
-                ("gh".to_string(), "https://github.com/%s".to_string()),
+                (
+                    "docs".to_string(),
+                    LinkEntry {
+                        target: "https://docs.example.com".to_string(),
+                        tags: vec![],
+                    },
+                ),
+                (
+                    "gh".to_string(),
+                    LinkEntry {
+                        target: "https://github.com/%s".to_string(),
+                        tags: vec![],
+                    },
+                ),
             ])
         );
 
         // Rename "gh" onto existing key "docs" atomically removes "gh" and overwrites "docs".
-        let links = db
-            .save_link(uid, Some("gh"), "docs", "https://new-docs.example.com")
+        let payload = db
+            .save_link(uid, Some("gh"), "docs", "https://new-docs.example.com", &[])
             .await
             .expect("rename gh onto docs");
         assert_eq!(
-            links,
+            payload.links,
             BTreeMap::from([(
                 "docs".to_string(),
-                "https://new-docs.example.com".to_string()
+                LinkEntry {
+                    target: "https://new-docs.example.com".to_string(),
+                    tags: vec![],
+                },
             )])
         );
 
@@ -741,9 +956,92 @@ mod tests {
 
         assert_eq!(
             db.delete_link(uid, "docs").await.expect("delete docs"),
-            Some(BTreeMap::new())
+            Some(LinksPayload {
+                links: BTreeMap::new(),
+                tags: vec![],
+            })
         );
-        assert_eq!(db.list_links(uid).await.expect("list empty"), BTreeMap::new());
+        assert_eq!(
+            db.list_links(uid).await.expect("list empty"),
+            LinksPayload {
+                links: BTreeMap::new(),
+                tags: vec![],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn save_update_rename_and_auto_delete_unused_tags() {
+        let db = setup_memory_db().await;
+        let user = db
+            .sync_user("golinks", &derive_auth_token("tag-secret"))
+            .await
+            .expect("sync user");
+        let uid = user.user_id;
+
+        let p1 = db
+            .save_link(
+                uid,
+                None,
+                "docs",
+                "https://docs.example.com",
+                &["work".to_string(), "docs".to_string()],
+            )
+            .await
+            .expect("insert docs with tags");
+        assert_eq!(p1.links["docs"].tags, vec!["docs", "work"]);
+        assert_eq!(p1.tags, vec!["docs", "work"]);
+
+        let p2 = db
+            .save_link(
+                uid,
+                None,
+                "gh",
+                "https://github.com/%s",
+                &["tools".to_string(), "work".to_string()],
+            )
+            .await
+            .expect("insert gh with tags");
+        assert_eq!(p2.links["gh"].tags, vec!["tools", "work"]);
+        assert_eq!(p2.tags, vec!["docs", "tools", "work"]);
+
+        // Removing "docs" tag from "docs" link auto-deletes unused "docs" tag.
+        let p3 = db
+            .save_link(
+                uid,
+                Some("docs"),
+                "docs",
+                "https://docs.example.com",
+                &["work".to_string()],
+            )
+            .await
+            .expect("update docs tags");
+        assert_eq!(p3.links["docs"].tags, vec!["work"]);
+        assert_eq!(p3.tags, vec!["tools", "work"]);
+
+        // Renaming "gh" onto "docs" replaces tags and auto-deletes unused "tools" and "work".
+        let p4 = db
+            .save_link(
+                uid,
+                Some("gh"),
+                "docs",
+                "https://eng.example.com",
+                &["eng".to_string()],
+            )
+            .await
+            .expect("rename gh onto docs with new tag");
+        assert_eq!(p4.links.len(), 1);
+        assert_eq!(p4.links["docs"].tags, vec!["eng"]);
+        assert_eq!(p4.tags, vec!["eng"]);
+
+        // Deleting the last link auto-deletes "eng".
+        let p5 = db
+            .delete_link(uid, "docs")
+            .await
+            .expect("delete docs")
+            .expect("deleted");
+        assert!(p5.links.is_empty());
+        assert!(p5.tags.is_empty());
     }
 
     #[tokio::test]
@@ -759,26 +1057,50 @@ mod tests {
             .expect("sync bob");
         assert_ne!(alice.user_id, bob.user_id);
 
-        db.save_link(alice.user_id, None, "docs", "https://alice.example.com/docs")
-            .await
-            .expect("insert alice docs");
-        db.save_link(bob.user_id, None, "docs", "https://bob.example.com/docs")
-            .await
-            .expect("insert bob docs");
+        db.save_link(
+            alice.user_id,
+            None,
+            "docs",
+            "https://alice.example.com/docs",
+            &["work".to_string(), "shared".to_string()],
+        )
+        .await
+        .expect("insert alice docs");
+        db.save_link(
+            bob.user_id,
+            None,
+            "docs",
+            "https://bob.example.com/docs",
+            &["work".to_string(), "shared".to_string()],
+        )
+        .await
+        .expect("insert bob docs");
 
         assert_eq!(
             db.list_links(alice.user_id).await.expect("list alice"),
-            BTreeMap::from([(
-                "docs".to_string(),
-                "https://alice.example.com/docs".to_string()
-            )])
+            LinksPayload {
+                links: BTreeMap::from([(
+                    "docs".to_string(),
+                    LinkEntry {
+                        target: "https://alice.example.com/docs".to_string(),
+                        tags: vec!["shared".to_string(), "work".to_string()],
+                    },
+                )]),
+                tags: vec!["shared".to_string(), "work".to_string()],
+            }
         );
         assert_eq!(
             db.list_links(bob.user_id).await.expect("list bob"),
-            BTreeMap::from([(
-                "docs".to_string(),
-                "https://bob.example.com/docs".to_string()
-            )])
+            LinksPayload {
+                links: BTreeMap::from([(
+                    "docs".to_string(),
+                    LinkEntry {
+                        target: "https://bob.example.com/docs".to_string(),
+                        tags: vec!["shared".to_string(), "work".to_string()],
+                    },
+                )]),
+                tags: vec!["shared".to_string(), "work".to_string()],
+            }
         );
 
         assert_eq!(
@@ -794,37 +1116,61 @@ mod tests {
             Some("https://bob.example.com/docs".to_string())
         );
 
-        // Alice updates & renames her link; Bob's link must remain untouched.
+        // Alice updates & renames her link; Bob's link and tags must remain untouched.
         db.save_link(
             alice.user_id,
             Some("docs"),
             "notes",
             "https://alice.example.com/notes",
+            &[],
         )
         .await
         .expect("rename alice docs -> notes");
 
+        let alice_after = db
+            .list_links(alice.user_id)
+            .await
+            .expect("list alice after rename");
         assert_eq!(
-            db.list_links(alice.user_id).await.expect("list alice after rename"),
-            BTreeMap::from([(
-                "notes".to_string(),
-                "https://alice.example.com/notes".to_string()
-            )])
+            alice_after,
+            LinksPayload {
+                links: BTreeMap::from([(
+                    "notes".to_string(),
+                    LinkEntry {
+                        target: "https://alice.example.com/notes".to_string(),
+                        tags: vec![],
+                    },
+                )]),
+                tags: vec![],
+            }
         );
+        let bob_after = db
+            .list_links(bob.user_id)
+            .await
+            .expect("list bob after alice rename");
         assert_eq!(
-            db.list_links(bob.user_id).await.expect("list bob after alice rename"),
-            BTreeMap::from([(
-                "docs".to_string(),
-                "https://bob.example.com/docs".to_string()
-            )])
+            bob_after,
+            LinksPayload {
+                links: BTreeMap::from([(
+                    "docs".to_string(),
+                    LinkEntry {
+                        target: "https://bob.example.com/docs".to_string(),
+                        tags: vec!["shared".to_string(), "work".to_string()],
+                    },
+                )]),
+                tags: vec!["shared".to_string(), "work".to_string()],
+            }
         );
 
-        // Alice deletes her link; Bob's link must still be untouched.
+        // Alice deletes her link; Bob's link and tags must still be untouched.
         assert_eq!(
             db.delete_link(alice.user_id, "notes")
                 .await
                 .expect("delete alice notes"),
-            Some(BTreeMap::new())
+            Some(LinksPayload {
+                links: BTreeMap::new(),
+                tags: vec![],
+            })
         );
         assert_eq!(
             db.delete_link(alice.user_id, "docs")
@@ -877,14 +1223,24 @@ mod tests {
             .expect("sync postgres user");
         assert!(user.user_id > 0);
 
-        let links = db
-            .save_link(user.user_id, None, "docs", "https://docs.example.com")
+        let payload = db
+            .save_link(
+                user.user_id,
+                None,
+                "docs",
+                "https://docs.example.com",
+                &["work".to_string()],
+            )
             .await
             .expect("save postgres link");
         assert_eq!(
-            links.get("docs").map(String::as_str),
-            Some("https://docs.example.com")
+            payload.links.get("docs"),
+            Some(&LinkEntry {
+                target: "https://docs.example.com".to_string(),
+                tags: vec!["work".to_string()],
+            })
         );
+        assert_eq!(payload.tags, vec!["work".to_string()]);
 
         assert_eq!(
             db.get_link_target(user.user_id, "docs")
@@ -898,6 +1254,7 @@ mod tests {
             .await
             .expect("delete postgres link")
             .expect("deleted row");
-        assert!(!remaining.contains_key("docs"));
+        assert!(!remaining.links.contains_key("docs"));
+        assert!(remaining.tags.is_empty());
     }
 }
