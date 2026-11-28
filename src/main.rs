@@ -2,6 +2,7 @@ mod auth;
 mod db;
 mod oidc;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use crate::oidc::{OidcError, OidcService, build_clear_state_cookie, sanitize_nex
 const DEFAULT_FAVICON_BYTES: &[u8] = include_bytes!("../assets/favicon.ico");
 const MAX_LINK_KEY_CHARS: usize = 32;
 const MAX_LINK_TARGET_CHARS: usize = 512;
+const MAX_TAG_CHARS: usize = 32;
 
 const FALLBACK_UI_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -84,6 +86,8 @@ struct SaveLinkRequest {
     original_key: Option<String>,
     key: String,
     target: String,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +331,24 @@ fn validate_link_target(target: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn normalize_and_validate_tags(raw_tags: &[String]) -> Result<Vec<String>, &'static str> {
+    let mut normalized = BTreeSet::new();
+    for raw in raw_tags {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.chars().any(char::is_whitespace) {
+            return Err("Tags must not contain whitespace.");
+        }
+        if trimmed.chars().count() > MAX_TAG_CHARS {
+            return Err("Each tag must be at most 32 characters.");
+        }
+        normalized.insert(trimmed.to_lowercase());
+    }
+    Ok(normalized.into_iter().collect())
+}
+
 async fn handle_root_get(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -366,8 +388,8 @@ async fn handle_root_get(
                 Err(resp) => return resp,
             };
             match state.db.list_links(user.user_id).await {
-                Ok(links) => {
-                    let resp = (StatusCode::OK, Json(json!({ "links": links }))).into_response();
+                Ok(payload) => {
+                    let resp = (StatusCode::OK, Json(payload)).into_response();
                     with_set_cookie(resp, refreshed_cookie)
                 }
                 Err(err) => {
@@ -442,13 +464,24 @@ async fn handle_root_post(
                 return json_error(StatusCode::BAD_REQUEST, msg);
             }
 
+            let tags = match normalize_and_validate_tags(&req.tags) {
+                Ok(t) => t,
+                Err(msg) => return json_error(StatusCode::BAD_REQUEST, msg),
+            };
+
             match state
                 .db
-                .save_link(user.user_id, req.original_key.as_deref(), &key, &target, &[])
+                .save_link(
+                    user.user_id,
+                    req.original_key.as_deref(),
+                    &key,
+                    &target,
+                    &tags,
+                )
                 .await
             {
-                Ok(links) => {
-                    let resp = (StatusCode::OK, Json(json!({ "links": links }))).into_response();
+                Ok(payload) => {
+                    let resp = (StatusCode::OK, Json(payload)).into_response();
                     with_set_cookie(resp, refreshed_cookie)
                 }
                 Err(err) => {
@@ -475,8 +508,8 @@ async fn handle_root_post(
             }
 
             match state.db.delete_link(user.user_id, key).await {
-                Ok(Some(links)) => {
-                    let resp = (StatusCode::OK, Json(json!({ "links": links }))).into_response();
+                Ok(Some(payload)) => {
+                    let resp = (StatusCode::OK, Json(payload)).into_response();
                     with_set_cookie(resp, refreshed_cookie)
                 }
                 Ok(None) => json_error(StatusCode::NOT_FOUND, "Link not found."),
@@ -1104,7 +1137,12 @@ mod tests {
         assert_eq!(get_resp.status(), StatusCode::OK);
         let get_body: serde_json::Value =
             serde_json::from_str(&body_text(get_resp).await).unwrap();
-        assert_eq!(get_body["links"]["docs"], "https://docs.example.com");
+        assert_eq!(
+            get_body["links"]["docs"]["target"],
+            "https://docs.example.com"
+        );
+        assert_eq!(get_body["links"]["docs"]["tags"], json!([]));
+        assert_eq!(get_body["tags"], json!([]));
 
         // saveLink (create)
         let create_resp = app
@@ -1911,5 +1949,230 @@ mod tests {
         );
         let override_body = override_resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(override_body.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn tag_normalization_validation_and_lifecycle() {
+        let (state, _dir) = test_state(false).await;
+        let cookie_hdr = make_jwt_cookie("golinks", "someSuperSecretValue");
+        let app = build_router(state);
+
+        // Save with mixed case, padding, duplicates, and empty entries -> normalized & sorted
+        let save_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "key": "gh",
+                            "target": "https://github.com/%s",
+                            "tags": [" Work ", "work", "", "  ", "DOCS"],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_resp.status(), StatusCode::OK);
+        let save_body: serde_json::Value =
+            serde_json::from_str(&body_text(save_resp).await).unwrap();
+        assert_eq!(save_body["links"]["gh"]["target"], "https://github.com/%s");
+        assert_eq!(save_body["links"]["gh"]["tags"], json!(["docs", "work"]));
+        assert_eq!(save_body["tags"], json!(["docs", "work"]));
+
+        // Redirect behavior is unaffected by tags
+        let redir_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/gh%20rust")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redir_resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            redir_resp.headers().get(header::LOCATION).unwrap(),
+            "https://github.com/rust"
+        );
+
+        // Tag with internal whitespace -> 400
+        let bad_ws_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "key": "gh",
+                            "target": "https://github.com/%s",
+                            "tags": ["bad tag"],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_ws_resp.status(), StatusCode::BAD_REQUEST);
+
+        // Tag exceeding 32 Unicode chars -> 400
+        let long_tag = "é".repeat(33);
+        let bad_len_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "key": "gh",
+                            "target": "https://github.com/%s",
+                            "tags": [long_tag],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_len_resp.status(), StatusCode::BAD_REQUEST);
+
+        // Omitting tags clears them and auto-deletes unused tags
+        let clear_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &cookie_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({
+                            "originalKey": "gh",
+                            "key": "gh",
+                            "target": "https://github.com/%s",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(clear_resp.status(), StatusCode::OK);
+        let clear_body: serde_json::Value =
+            serde_json::from_str(&body_text(clear_resp).await).unwrap();
+        assert_eq!(clear_body["links"]["gh"]["tags"], json!([]));
+        assert_eq!(clear_body["tags"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn oidc_multi_user_tags_are_isolated() {
+        let (state, _server, _dir) = oidc_test_state().await;
+        let alice_secret = auth::generate_random_user_secret();
+        let bob_secret = auth::generate_random_user_secret();
+        state
+            .db
+            .get_or_create_user("alice", &alice_secret)
+            .await
+            .unwrap();
+        state
+            .db
+            .get_or_create_user("bob", &bob_secret)
+            .await
+            .unwrap();
+
+        let now = auth::current_unix_secs();
+        let alice_cookie = format!(
+            "golinks_auth={}",
+            auth::sign_session_jwt("alice", &alice_secret, now, TEST_SESSION_TTL_SECS)
+        );
+        let bob_cookie = format!(
+            "golinks_auth={}",
+            auth::sign_session_jwt("bob", &bob_secret, now, TEST_SESSION_TTL_SECS)
+        );
+        let app = build_router(state);
+
+        let save_alice = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &alice_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":"docs","target":"https://alice.example.com","tags":["work","alice-only"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_alice.status(), StatusCode::OK);
+
+        let save_bob = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=saveLink")
+                    .header(header::COOKIE, &bob_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":"docs","target":"https://bob.example.com","tags":["work","bob-only"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_bob.status(), StatusCode::OK);
+
+        // Alice deletes her link -> Alice has no tags, Bob still has ["bob-only", "work"]
+        let del_alice = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/?action=deleteLink")
+                    .header(header::COOKIE, &alice_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"key":"docs"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_alice.status(), StatusCode::OK);
+        let del_body: serde_json::Value =
+            serde_json::from_str(&body_text(del_alice).await).unwrap();
+        assert_eq!(del_body["tags"], json!([]));
+
+        let bob_get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/?action=getLinks")
+                    .header(header::COOKIE, &bob_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bob_get.status(), StatusCode::OK);
+        let bob_body: serde_json::Value = serde_json::from_str(&body_text(bob_get).await).unwrap();
+        assert_eq!(bob_body["tags"], json!(["bob-only", "work"]));
+        assert_eq!(
+            bob_body["links"]["docs"]["tags"],
+            json!(["bob-only", "work"])
+        );
     }
 }
